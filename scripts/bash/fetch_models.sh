@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 # -------- GitHub release asset downloader (generic) --------
 get_release_asset_url () {
