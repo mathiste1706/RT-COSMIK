@@ -16,6 +16,8 @@ import meshcat
 import meshcat.geometry as g
 import meshcat.transformations as tf
 
+import json
+
 import cv2
 import numpy as np
 import torch
@@ -46,6 +48,7 @@ def list_videos(data_dir: Path) -> List[Path]:
 
 @dataclass
 class OfflineVideoSource:
+    points_saved=False
     paths: List[Path]
     size_wh: Tuple[int, int]
 
@@ -60,6 +63,7 @@ class OfflineVideoSource:
         for cap in self.caps:
             ok, frame = cap.read()
             if not ok:
+                self.points_saved=True
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = cap.read()
                 if not ok:
@@ -75,6 +79,10 @@ class OfflineVideoSource:
             cap.release()
 
 def main(args):
+
+    p3d_file=[]
+    first_run_points_saved=True
+
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -142,8 +150,12 @@ def main(args):
 
     else: # offline mode
 
+
         # --- 1. INITIALISATION MESHCAT ---
         vis = meshcat.Visualizer()
+        vis["/Background"].set_property("top_color", [1, 1, 1])  # Dark gray (RGB values in [0, 1])
+        vis["/Background"].set_property("bottom_color", [0.65, 0.65, 0.65])  # Same color → flat background
+
         LOGGER.info(f"[INFO] Meshcat visualizer available here: {vis.url()}")
 
         vis_markers = vis["markers"]
@@ -212,6 +224,14 @@ def main(args):
                 dists=dists,
                 projections=projections,
             )
+            if args.save:
+                p3d_file.append(p3d.tolist())
+
+                if src.points_saved and first_run_points_saved:
+                        with open("/root/workspace/RT-COSMIK/points_saved.json", "w") as f:
+                            json.dump(p3d_file, f)
+                            first_run_points_saved=False
+                        print("\n\n SAVED")
 
             poses_triangul = torch.from_numpy(p3d).to(dtype=torch.float32)
             poses_cam0=nlf_out['poses3d'][0]/1000
@@ -228,6 +248,7 @@ def main(args):
                     g.PointCloud(position=points_all, color=colors, size=0.02)
                 )
 
+                #points_all2 = Triangulated result
                 points_all2 = poses_triangul.view(-1, 3).cpu().numpy().T
                 colors2 = np.zeros_like(points_all2)
                 colors2[0, :] = 0.0  # R
@@ -237,6 +258,8 @@ def main(args):
                 vis_markers2.set_object(
                     g.PointCloud(position=points_all2, color=colors2, size=0.02)
                 )
+
+                
 
             else:
                 vis_markers.delete()
@@ -249,6 +272,7 @@ if __name__ == "__main__":
     p.add_argument("--online", action="store_true")
     p.add_argument("--data-dir", type=str, default="data", help="Folder containing input videos")
     p.add_argument("--videos", nargs="*", default=None, help="Optional explicit list of input videos")
+    p.add_argument("--save", action="store_true", default=False, help="bool to save the points calculated in directory RT-COSMIK under the name points_saved.json")
     args = p.parse_args()
 
     if args.online:

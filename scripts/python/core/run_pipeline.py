@@ -16,6 +16,8 @@ import meshcat
 import meshcat.geometry as g
 import meshcat.transformations as tf
 
+import json
+
 import cv2
 import numpy as np
 import torch
@@ -221,6 +223,7 @@ def list_videos(data_dir: Path) -> List[Path]:
 class OfflineVideoSource:
     paths: List[Path]
     size_wh: Tuple[int, int]
+    points_saved=False
 
     def __post_init__(self):
         self.caps = [cv2.VideoCapture(str(p)) for p in self.paths]
@@ -229,10 +232,14 @@ class OfflineVideoSource:
                 raise RuntimeError(f"Could not open video: {p}")
 
     def read(self) -> Optional[List[np.ndarray]]:
+
         frames: List[np.ndarray] = []
         for cap in self.caps:
             ok, frame = cap.read()
             if not ok:
+                
+                self.points_saved=True
+
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = cap.read()
                 if not ok:
@@ -249,6 +256,10 @@ class OfflineVideoSource:
 
 
 def main(args):
+
+    p3d_file=[]
+    first_run_points_saved=True
+
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -409,6 +420,15 @@ def main(args):
             else:
                 p3d_buffer.append(p3d_in_world) # add the keypoints to the buffer normally
             
+            if args.save:
+                p3d_file.append(p3d_in_world.tolist())
+                
+                if src.points_saved and first_run_points_saved:
+                    with open("/root/workspace/RT-COSMIK/points_saved.json", "w") as f:
+                        json.dump(p3d_file, f)
+                        first_run_points_saved=False
+                    print("\n\n SAVED")
+
             if len(p3d_buffer) == settings.N:
                 p3d_buffer_array = np.array(p3d_buffer)
 
@@ -534,7 +554,7 @@ def main(args):
                     else : 
                         raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")
             t1=time.perf_counter()
-            print(f"Time elapsed for treating one frame = {t1-t0} ms")
+            #print(f"Time elapsed for treating one frame = {t1-t0} ms")
 
 
 if __name__ == "__main__":
@@ -542,6 +562,7 @@ if __name__ == "__main__":
     p.add_argument("--online", action="store_true")
     p.add_argument("--data-dir", type=str, default="data", help="Folder containing input videos")
     p.add_argument("--videos", nargs="*", default=None, help="Optional explicit list of input videos")
+    p.add_argument("--save", action="store_true", default=False, help="bool to save the points calculated in directory RT-COSMIK under the name points_saved.json")
     args = p.parse_args()
 
     if args.online:
