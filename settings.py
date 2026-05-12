@@ -41,6 +41,7 @@ class Settings:
     # NLF
     cano_path: str = "/root/workspace/RT-COSMIK/weights/canonical_verts/smplx.npy"
     nlf_path: str = "/root/workspace/RT-COSMIK/weights/nlf/nlf_s_multi_0.2.2.torchscript"
+    
     nlf_indices = [             # For SMPLX model
         8421, 5727, 8371, 5677, # pelvis: RASI, LASI, RPSI, LPSI 
         5484, 5489, 5500, 6629, 3878, 7040, 4302, 7105, 4369, 7584, 4848, 7457, 4721, # upper: C7, T11, T6,  RSHO, LSHO, RELB, LELB, RMELB, LMELB, RWRI, LWRI, RMWRI, LMWRI
@@ -50,6 +51,9 @@ class Settings:
         9120,9002,616,6,9929,9448,  # face: Nose, Head, REar, LEar, REye, LEye
     ]
 
+    '''
+    nlf_indices =list(range(0,10475))              # For the complete SMPLX model
+    '''
     # Yolo detector
     yolo_path: str = "/root/workspace/RT-COSMIK/weights/yolo/yolov10n.engine"
     yolo_conf = 0.2
