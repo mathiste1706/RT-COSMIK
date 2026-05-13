@@ -34,7 +34,7 @@ logging.basicConfig(
 
 def list_videos(data_dir: Path) -> List[Path]:
     if not data_dir.exists():
-        raise FileNotFoundError(f"data dir does not exist: {data_dir}")
+        raise FileNotFoundError(f"data dir does not exist: {data_dir.resolve()}")
     vids = [p for p in sorted(data_dir.iterdir()) if p.suffix.lower() in [".mp4"]]
     return vids
 
@@ -161,6 +161,7 @@ def main(args):
             nlf_out, infer_ms, yres, boxes = est.estimate_from_frames(frames)
 
             print(f"Timings to perform inference = {infer_ms}")
+            
 
             vis_frames = est.visualize_frames(
                 frames,
