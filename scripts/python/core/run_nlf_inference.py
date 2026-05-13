@@ -42,6 +42,7 @@ def list_videos(data_dir: Path) -> List[Path]:
 class OfflineVideoSource:
     paths: List[Path]
     size_wh: Tuple[int, int]
+    points_saved=False
 
     def __post_init__(self):
         self.caps = [cv2.VideoCapture(str(p)) for p in self.paths]
@@ -54,6 +55,7 @@ class OfflineVideoSource:
         for cap in self.caps:
             ok, frame = cap.read()
             if not ok:
+                self.points_saved=True
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = cap.read()
                 if not ok:
@@ -69,6 +71,7 @@ class OfflineVideoSource:
             cap.release()
 
 def main(args):
+
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -161,7 +164,6 @@ def main(args):
             nlf_out, infer_ms, yres, boxes = est.estimate_from_frames(frames)
 
             print(f"Timings to perform inference = {infer_ms}")
-            
 
             vis_frames = est.visualize_frames(
                 frames,
