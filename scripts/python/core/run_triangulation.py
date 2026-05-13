@@ -42,7 +42,7 @@ LOGGER = logging.getLogger(__name__)
 
 def list_videos(data_dir: Path) -> List[Path]:
     if not data_dir.exists():
-        raise FileNotFoundError(f"data dir does not exist: {data_dir}")
+        raise FileNotFoundError(f"data dir does not exist: {data_dir.resolve()}")
     vids = [p for p in sorted(data_dir.iterdir()) if p.suffix.lower() in [".mp4"]]
     return vids
 
@@ -224,11 +224,17 @@ def main(args):
                 dists=dists,
                 projections=projections,
             )
-            if args.save:
+            if args.save:   # Works even if it's a string
                 p3d_file.append(p3d.tolist())
 
                 if src.points_saved and first_run_points_saved:
-                        with open("/root/workspace/RT-COSMIK/points_saved.json", "w") as f:
+                        
+                        if isinstance(args.save, str):
+                            target_path=args.save
+                        else:
+                            target_path="points_saved.json"
+                        
+                        with open(target_path, "w") as f:
                             json.dump(p3d_file, f)
                             first_run_points_saved=False
                         print("\n\n SAVED")
@@ -272,7 +278,7 @@ if __name__ == "__main__":
     p.add_argument("--online", action="store_true")
     p.add_argument("--data-dir", type=str, default="data", help="Folder containing input videos")
     p.add_argument("--videos", nargs="*", default=None, help="Optional explicit list of input videos")
-    p.add_argument("--save", action="store_true", default=False, help="bool to save the points calculated in directory RT-COSMIK under the name points_saved.json")
+    p.add_argument("--save", nargs="?", const="point_saved.json", default=False, help="flag to save the points calculated at the specific path or by the default in the relative path under the name points_saved.json ")
     args = p.parse_args()
 
     if args.online:
