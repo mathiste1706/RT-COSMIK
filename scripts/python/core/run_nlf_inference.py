@@ -10,7 +10,8 @@ import argparse
 
 import time
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import subprocess
 from typing import List, Optional, Sequence, Tuple
 
 import cv2
@@ -42,33 +43,68 @@ def list_videos(data_dir: Path) -> List[Path]:
 class OfflineVideoSource:
     paths: List[Path]
     size_wh: Tuple[int, int]
-    points_saved=False
+    points_saved: bool = False
+    # Internal storage for processes
+    _procs: List[subprocess.Popen] = field(default_factory=list, init=False)
 
     def __post_init__(self):
-        self.caps = [cv2.VideoCapture(str(p)) for p in self.paths]
-        for p, cap in zip(self.paths, self.caps):
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open video: {p}")
+        self._start_pipes()
+
+    def _start_pipes(self):
+        """Initializes or restarts the FFmpeg subprocesses."""
+        self.release() # Ensure old pipes are closed
+        w, h = self.size_wh
+        
+        for p in self.paths:
+            command = [
+                'ffmpeg',
+                '-loglevel', 'error',
+                '-stream_loop', '-1',      # Infinite looping
+                '-i', str(p),
+                '-vf', f'scale={w}:{h}, fps=15',   
+                '-f', 'image2pipe',
+                '-pix_fmt', 'bgr24',         
+                '-vcodec', 'rawvideo',
+                '-'
+            ]
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, bufsize=w * h * 3)
+            self._procs.append(proc)
 
     def read(self) -> Optional[List[np.ndarray]]:
         frames: List[np.ndarray] = []
-        for cap in self.caps:
-            ok, frame = cap.read()
-            if not ok:
-                self.points_saved=True
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok, frame = cap.read()
-                if not ok:
-                    return None
-            W, H = self.size_wh
-            if frame.shape[1] != W or frame.shape[0] != H:
-                frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_LINEAR)
-            frames.append(frame)
+        w, h = self.size_wh
+        frame_size = w * h * 3
+
+        for i, proc in enumerate(self._procs):
+            try:
+                raw_frame = proc.stdout.read(frame_size)
+                
+                # Check if we got a full frame
+                if len(raw_frame) != frame_size:
+                    # If we get 0 bytes, the video ended. 
+                    # If we get > 0 but < frame_size, the pipe broke.
+                    self.points_saved = True
+                    self._start_pipes() 
+                    return self.read()
+
+                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((h, w, 3))
+                frames.append(frame)
+            except Exception as e:
+                print(f"Pipe error: {e}")
+                return None
+                
         return frames
 
     def release(self):
-        for cap in self.caps:
-            cap.release()
+        for proc in self._procs:
+            if proc.poll() is None: # Process is still running
+                proc.stdout.close() # Close stdout first
+                proc.terminate()    # Then terminate
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        self._procs = []
 
 def main(args):
 
