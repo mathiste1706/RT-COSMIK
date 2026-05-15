@@ -7,7 +7,8 @@ import yaml
 def list_cameras():
     """
     Use v4l2-ctl to list all connected cameras and their device paths.
-    Returns a dictionary of camera indices and associated device names.
+    Return:
+    cameras: dictionary of camera indices and associated device names.
     """
     cameras = {}
     try:
@@ -26,16 +27,31 @@ def list_cameras():
         print("Error using v4l2-ctl:", e)
     return cameras
 
-def rt_to_homogeneous(R, T):
-    """Convert (R, T) to a 4x4 homogeneous transformation matrix."""
-    T = T.reshape(3,)
-    H = np.eye(4)
-    H[:3, :3] = R
-    H[:3, 3] = T
-    return H
+def rt_to_homogeneous(R, translation_matrix):
+    """
+    Convert (R, translation_matrix) to a 4x4 homogeneous transformation matrix.
+    Parameters: 
+    R is a rotation matrix (3x3)
+    translation_matrix is a translation matrix (3x1)
+    Return:
+    T: homogenous translation matrix (4x4)
+    """
+    
+    translation_matrix = translation_matrix.reshape(3,)
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = translation_matrix
+    return T
 
 def invert_homogeneous(T):
-    """Invert a 4x4 homogeneous transformation matrix."""
+    """
+    Invert a 4x4 homogeneous transformation matrix.
+    Parameter: 
+    T: homogenous translation matrix (4x4)
+    Return:
+    T_inv: the inverse matrix of T
+    """
+    
     R = T[:3, :3]
     t = T[:3, 3]
     T_inv = np.eye(4)
@@ -43,17 +59,27 @@ def invert_homogeneous(T):
     T_inv[:3, 3] = -R.T @ t
     return T_inv
 
-def decompose_homogeneous(H):
-    """Extract (R, T) from a 4x4 homogeneous matrix."""
-    R = H[:3, :3]
-    T = H[:3, 3]
-    return R, T
+def decompose_homogeneous(T):
+    """
+    Extract (R, translation_matrix) from T a 4x4 homogeneous matrix.
+    Parameter:
+    T: a 4x4 homogeneous matrix
+    Returns:
+    R: Rotation matrix (3x3) from transformation matrix T
+    translation_matrix: translation_matrix (3x1) from transformation matrix T
+    """
+    
+    R = T[:3, :3]
+    translation_matrix = T[:3, 3]
+    return R, translation_matrix
 
-def get_cameras_params(K1, D1, K2, D2, R, T):
-    dict_cam = {
-        "cam1": {
-            "mtx":np.array(K1),
-            "dist":D1,
+def get_cameras_params(K1, D1, K2, D2, R, translation_matrix2 translation_matrix1=[0.0, 0.0, 0.0]):
+   
+    """
+    dict_camera = {
+        "camera1": {
+            "matrix":np.array(K1),
+            "distortion_coeff":D1,
             "rotation":np.eye(3),
             "translation":[
                 0.,
@@ -61,36 +87,38 @@ def get_cameras_params(K1, D1, K2, D2, R, T):
                 0.,
             ],
         },
-        "cam2": {
-            "mtx":np.array(K2),
-            "dist":D2,
+        "camera2": {
+            "matrix":np.array(K2),
+            "distortion_coeff":D2,
             "rotation":R,
-            "translation":T,
+            "translation":translation_matrix2,
         },
     }
 
-    rotations=[]
-    translations=[]
-    dists=[]
-    mtxs=[]
-    projections=[]
+    rotations_list=[]
+    translations_list=[]
+    distortion_coeff_list=[]
+    matrix_list=[]
+    projection_list=[]
 
-    for cam in dict_cam :
-        rotation=np.array(dict_cam[cam]["rotation"])
-        rotations.append(rotation)
-        translation=np.array([dict_cam[cam]["translation"]]).reshape(3,1)
-        translations.append(translation)
+    for camera in dict_camera :
+        rotation=np.array(dict_camera[camera]["rotation"])
+        rotation_list.append(rotation)
+        translation=np.array([dict_camera[camera]["translation"]]).reshape(3,1)
+        translation_list.append(translation)
         projection = np.concatenate([rotation, translation], axis=-1)
-        projections.append(projection)
-        dict_cam[cam]["projection"] = projection
-        dists.append(dict_cam[cam]["dist"])
-        mtxs.append(dict_cam[cam]["mtx"])
-    return mtxs, dists, projections, rotations, translations
+        projection_list.append(projection)
+        dict_camera[camera]["projection"] = projection
+        distortion_coeff_list.append(dict_camera[camera]["distortion_coeff"])
+        matrix_list.append(dict_camera[camera]["matrix"])
+        """
+    
+    return projection_coeff_list, distortion_coeff_list, projection_list, rotation_list, translation_list
 
-def get_four_cameras_params(K1,D1,K2,D2,K3,D3,K4,D4,R2, T2,R3, T3,R4, T4):
+def get_four_cameras_params(K1, D1, K2, D2, K3, D3, K4, D4, R2, T2, R3, T3, R4, T4):
     dict_cam = {
         "cam1": {
-            "mtx":np.array(K1),
+            "matrix":np.array(K1),
             "dist":D1,
             "rotation":np.eye(3),
             "translation":[
@@ -100,19 +128,19 @@ def get_four_cameras_params(K1,D1,K2,D2,K3,D3,K4,D4,R2, T2,R3, T3,R4, T4):
             ],
         },
         "cam2": {
-            "mtx":np.array(K2),
+            "matrix":np.array(K2),
             "dist":D2,
             "rotation":R2,
             "translation":T2,
         },
         "cam3": {
-            "mtx":np.array(K3),
+            "matrix":np.array(K3),
             "dist":D3,
             "rotation":R3,
             "translation":T3,
         },
         "cam4": {
-            "mtx":np.array(K4),
+            "matrix":np.array(K4),
             "dist":D4,
             "rotation":R4,
             "translation":T4,
@@ -253,7 +281,7 @@ def load_camera_parameters(config_path):
     K1, D1 = load_cam_params(os.path.join(config_path, "c0_params_color.yaml"))
     K2, D2 = load_cam_params(os.path.join(config_path, "c2_params_color.yaml"))
     R, T = load_cam_to_cam_params(os.path.join(config_path, "c0_to_c2_params_color.yaml"))
-    return get_cameras_params(K1, D1, K2, D2, R, T)
+    return (K1, D1, K2, D2, R, T)
 
 def load_world_transformation(config_path):
     """Load world transformation matrix."""
@@ -304,4 +332,4 @@ def load_four_camera_parameters(config_path):
     R2, T2 = load_cam_to_cam_params(os.path.join(config_path, "c0_to_c4_params_color.yaml"))
     R3, T3 = load_cam_to_cam_params(os.path.join(config_path, "c0_to_c6_params_color.yaml"))
 
-    return get_four_cameras_params(K1, D1, K2, D2,K3, D3, K4, D4, R1, T1,R2, T2,R3, T3)
+    return (K1, D1, K2, D2,K3, D3, K4, D4, R1, T1,R2, T2,R3, T3)
