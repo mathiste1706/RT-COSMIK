@@ -251,26 +251,11 @@ class OfflineVideoSource:
         frame_size = w * h * 3
         
         for p in self.paths:
-            '''
+           
             command = [
                 'ffmpeg',
-                '-loglevel', 'error',
-                '-stream_loop', '-1',
-                '-hwaccel', 'cuda',
-                '-hwaccel_output_format', 'cuda',  # Keep frames in VRAM      
-                '-i', str(p),
-                '-vf', f'scale_cuda={w}:{h},hwdownload,format=bgr24',  
-                '-f', 'image2pipe',         
-                '-vcodec', 'rawvideo',
-                '-pix_fmt', 'bgr24',
-                '-blocksize', str(frame_size), # Force FFmpeg to dump full frames in one burst
-                '-'
-            ]
-            '''
-            command = [
-                'ffmpeg',
-                '-loglevel', 'error',
                 '-hwaccel', 'auto',
+                '-loglevel', 'error',
                 '-stream_loop', '-1',      # Infinite looping
                 '-i', str(p),
                 '-vf', f'scale={w}:{h}',   
@@ -280,7 +265,7 @@ class OfflineVideoSource:
                 '-'
             ]
             # Use w*h to intentionally enforce your fast, synchronous trick 
-            proc = subprocess.Popen(command, stdout=subprocess.PIPE, bufsize=(w*h*3))  
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, bufsize=(w*h))  
             self._procs.append(proc)
 
     def read(self) -> Optional[List[np.ndarray]]:
