@@ -61,7 +61,7 @@ class OfflineVideoSource:
                 '-loglevel', 'error',
                 '-stream_loop', '-1',      # Infinite looping
                 '-i', str(p),
-                '-vf', f'scale={w}:{h}, fps=15',   
+                '-vf', f'scale={w}:{h}',   
                 '-f', 'image2pipe',
                 '-pix_fmt', 'bgr24',         
                 '-vcodec', 'rawvideo',

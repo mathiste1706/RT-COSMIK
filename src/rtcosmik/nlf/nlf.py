@@ -255,10 +255,13 @@ class NLFEstimator:
         # 3) HWC -> CHW into a contiguous buffer
         self._gpu_chw_u8.copy_(self._gpu_hwc_u8.permute(0, 3, 1, 2), non_blocking=True)
 
+        
+        
         # 4) in-place BGR -> RGB using a persistent temp channel (no alloc)
         self._tmp_ch.copy_(self._gpu_chw_u8[:, 0], non_blocking=True)      # B
         self._gpu_chw_u8[:, 0].copy_(self._gpu_chw_u8[:, 2], non_blocking=True)  # R -> slot 0
         self._gpu_chw_u8[:, 2].copy_(self._tmp_ch, non_blocking=True)      # B -> slot 2
+        
 
         # 5) cast + normalize into persistent fp16 tensor (copy_ does casting)
         self._gpu_fp16.copy_(self._gpu_chw_u8, non_blocking=True)

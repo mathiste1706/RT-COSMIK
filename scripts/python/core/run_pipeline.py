@@ -219,73 +219,104 @@ def list_videos(data_dir: Path) -> List[Path]:
     vids = [p for p in sorted(data_dir.iterdir()) if p.suffix.lower() in [".mp4"]]
     return vids
 
+import subprocess
+import numpy as np
+from pathlib import Path
+from typing import List, Tuple, Optional
+from dataclasses import dataclass, field
+
 @dataclass
 class OfflineVideoSource:
     paths: List[Path]
     size_wh: Tuple[int, int]
     points_saved: bool = False
-    # Internal storage for processes
+    
+    # Internal storage
     _procs: List[subprocess.Popen] = field(default_factory=list, init=False)
+    _buffers: List[np.ndarray] = field(default_factory=list, init=False)
 
     def __post_init__(self):
+        w, h = self.size_wh
+        # Pre-allocate static, contiguous memory blocks for the frames on startup
+        # This memory is reused indefinitely. No more dynamic RAM allocation!
+        self._buffers = [
+            np.empty((h, w, 3), dtype=np.uint8) for _ in self.paths
+        ]
         self._start_pipes()
 
     def _start_pipes(self):
         """Initializes or restarts the FFmpeg subprocesses."""
-        self.release() # Ensure old pipes are closed
+        self.release() 
         w, h = self.size_wh
+        frame_size = w * h * 3
         
         for p in self.paths:
+            '''
             command = [
                 'ffmpeg',
                 '-loglevel', 'error',
+                '-stream_loop', '-1',
+                '-hwaccel', 'cuda',
+                '-hwaccel_output_format', 'cuda',  # Keep frames in VRAM      
+                '-i', str(p),
+                '-vf', f'scale_cuda={w}:{h},hwdownload,format=bgr24',  
+                '-f', 'image2pipe',         
+                '-vcodec', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-blocksize', str(frame_size), # Force FFmpeg to dump full frames in one burst
+                '-'
+            ]
+            '''
+            command = [
+                'ffmpeg',
+                '-loglevel', 'error',
+                '-hwaccel', 'auto',
                 '-stream_loop', '-1',      # Infinite looping
                 '-i', str(p),
-                '-vf', f'scale={w}:{h}, fps=30',   
+                '-vf', f'scale={w}:{h}',   
                 '-f', 'image2pipe',
                 '-pix_fmt', 'bgr24',         
                 '-vcodec', 'rawvideo',
                 '-'
             ]
-            proc = subprocess.Popen(command, stdout=subprocess.PIPE, bufsize=w * h * 3)
+            # Use w*h to intentionally enforce your fast, synchronous trick 
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, bufsize=(w*h*3))  
             self._procs.append(proc)
 
     def read(self) -> Optional[List[np.ndarray]]:
-        frames: List[np.ndarray] = []
         w, h = self.size_wh
         frame_size = w * h * 3
 
         for i, proc in enumerate(self._procs):
             try:
-                raw_frame = proc.stdout.read(frame_size)
+                # Direct-to-RAM Read: Pull bytes straight into our pre-allocated array memory
+                # This bypasses the creation of a temporary 'raw_frame' byte string completely.
+                bytes_read = proc.stdout.readinto(self._buffers[i])
                 
                 # Check if we got a full frame
-                if len(raw_frame) != frame_size:
-                    # If we get 0 bytes, the video ended. 
-                    # If we get > 0 but < frame_size, the pipe broke.
+                if bytes_read != frame_size:
                     self.points_saved = True
                     self._start_pipes() 
                     return self.read()
 
-                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((h, w, 3))
-                frames.append(frame)
             except Exception as e:
                 print(f"Pipe error: {e}")
                 return None
                 
-        return frames
+        # Return the list of pre-allocated buffers. 
+        # Note: If your neural network modifies the frame in-place, use [b.copy() for b in self._buffers]
+        return self._buffers
 
     def release(self):
         for proc in self._procs:
-            if proc.poll() is None: # Process is still running
-                proc.stdout.close() # Close stdout first
-                proc.terminate()    # Then terminate
+            if proc.poll() is None: 
+                proc.stdout.close() 
+                proc.terminate()    
                 try:
                     proc.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
         self._procs = []
-
 
 def main(args):
 
@@ -381,6 +412,18 @@ def main(args):
 
         NUM_CAMERAS = len(paths)
 
+        """Uses ffprobe to read the total number of frames from the video header."""
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=nb_frames',
+            '-of', 'json', str(paths[0])
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        total_frames=int(data['streams'][0]['nb_frames'])
+        LOGGER.info(f"[INFO] Total frames determined from ffprobe: {total_frames}")
+
         src = OfflineVideoSource(paths=paths, size_wh=(W, H))
 
         est = NLFEstimator(
@@ -407,195 +450,231 @@ def main(args):
         )
         iir_filter.add_filter(order=settings.order, cutoff=settings.cutoff_freq, filter_type=settings.filter_type)
 
-        while True:
-            t0=time.perf_counter()
-            frames = src.read()
-            if frames is None:
-                break
+        frame_counter = 0
+        start_time = time.perf_counter()
+        try:
+            while frame_counter<total_frames:
 
-            nlf_out, infer_ms, yres, boxes = est.estimate_from_frames(frames)
+                t0=time.perf_counter()
+                frames = src.read()
 
-            nlf_out_2d = nlf_out["poses2d"]
+                if frames is None:
+                    break
 
-            if nlf_out_2d is None or len(nlf_out_2d) < NUM_CAMERAS:
-                continue
+                nlf_out, infer_ms, yres, boxes = est.estimate_from_frames(frames)
 
-            keypoints_list = [None] * NUM_CAMERAS
-            valid_cam_ids = []
+                nlf_out_2d = nlf_out["poses2d"]
 
-            for ii in range(NUM_CAMERAS):
-                poses2d = nlf_out_2d[ii]
-                
-                if poses2d is None or len(poses2d) == 0 or poses2d[0] is None:
+                if nlf_out_2d is None or len(nlf_out_2d) < NUM_CAMERAS:
                     continue
 
-                keypoints_list[ii] = poses2d[0].detach().float().cpu().numpy()
-                valid_cam_ids.append(ii)
+                keypoints_list = [None] * NUM_CAMERAS
+                valid_cam_ids = []
 
-            if len(valid_cam_ids) < 2:
-                continue
+                for ii in range(NUM_CAMERAS):
+                    poses2d = nlf_out_2d[ii]
+                    
+                    if poses2d is None or len(poses2d) == 0 or poses2d[0] is None:
+                        continue
 
-            p3d = triangulate_points(
-                keypoints_list=keypoints_list,
-                mtxs=mtxs,
-                dists=dists,
-                projections=projections,
-            )
+                    keypoints_list[ii] = poses2d[0].detach().float().cpu().numpy()
+                    valid_cam_ids.append(ii)
 
-            p3d_np = torch.from_numpy(p3d).to(dtype=torch.float32)
+                if len(valid_cam_ids) < 2:
+                    continue
 
-            p3d_in_world=np.array([np.dot(world_R1_cam,point) + world_T1_cam for point in p3d_np])
-
-            if first_sample:
-                for k in range(settings.N):
-                    p3d_buffer.append(p3d_in_world)  # add the 1st frame 30 times
-            else:
-                p3d_buffer.append(p3d_in_world) # add the keypoints to the buffer normally
-            
-            if args.save:   # Works even if it's a string
-                p3d_file.append(p3d.tolist())
-
-                if src.points_saved and first_run_points_saved:
-                        
-                        if isinstance(args.save, str):
-                            target_path=args.save
-                        else:
-                            target_path="points_saved.json"
-
-                        with open(target_path, "w") as f:
-                            json.dump(p3d_file, f)
-                            first_run_points_saved=False
-                        print("\n\n SAVED")
-
-            if len(p3d_buffer) == settings.N:
-                p3d_buffer_array = np.array(p3d_buffer)
-
-                # Filter keypoints in world to remove noisy artefacts 
-                filtered_p3d_buffer = iir_filter.filter(np.reshape(p3d_buffer_array,(settings.N, 3*len(settings.marker_names))))
-                filtered_p3d_buffer = np.reshape(filtered_p3d_buffer,(settings.N, len(settings.marker_names), 3))
-
-                augmented_markers=filtered_p3d_buffer[-1]
-
-                # VISUALISATION OF AUGMENTED MARKERS in RED
-                colors = np.zeros_like(augmented_markers.T)
-                colors[0, :] = 1.0  # R
-                colors[1, :] = 0.0  # G
-                colors[2, :] = 0.0  # B
-
-                vis_markers.set_object(
-                    g.PointCloud(position=augmented_markers.T, color=colors, size=0.02)
+                p3d = triangulate_points(
+                    keypoints_list=keypoints_list,
+                    mtxs=mtxs,
+                    dists=dists,
+                    projections=projections,
                 )
 
+                p3d_np = torch.from_numpy(p3d).to(dtype=torch.float32)
+
+                p3d_in_world=np.array([np.dot(world_R1_cam,point) + world_T1_cam for point in p3d_np])
+
                 if first_sample:
-                    mks_dict = dict(zip(settings.marker_names, augmented_markers))
+                    for k in range(settings.N):
+                        p3d_buffer.append(p3d_in_world)  # add the 1st frame 30 times
+                else:
+                    p3d_buffer.append(p3d_in_world) # add the keypoints to the buffer normally
+                
+                if args.save:   # Works even if it's a string
+                    p3d_file.append(p3d.tolist())
 
-                    human = robex.human.HumanLoader(height=settings.human_height, weight=settings.human_weight, gender=settings.human_gender).robot
-                    human_model = human.model
-                    human_collision_model = human.collision_model
-                    human_visual_model = human.visual_model
+                    if src.points_saved and first_run_points_saved:
+                            
+                            if isinstance(args.save, str):
+                                target_path=args.save
+                            else:
+                                target_path="points_saved.json"
 
-                    #scale the model to data
-                    human_model = scale_human_model(human_model, mks_dict, gender=settings.human_gender, subject_height=settings.human_height)
-                    human_model= mks_registration(human_model, mks_dict, gender=settings.human_gender, subject_height=settings.human_height)
-                    # human_data = pin.Data(human_model)
+                            with open(target_path, "w") as f:
+                                json.dump(p3d_file, f)
+                                first_run_points_saved=False
+                            print("\n\n SAVED")
 
-                    # Init meshcat viewer for human
-                    # Visualizers
-                    viz_human = MeshcatVisualizer(human_model, human_collision_model, human_visual_model)
-                    viz_human.initViewer(vis, open=True)
-                    
-                    # Don't delete the whole Meshcat tree: keep '/markers' etc.
-                    try:
-                        vis["ref"].delete()
-                    except Exception:
-                        pass
-                    viz_human.loadViewerModel("ref")
+                if len(p3d_buffer) == settings.N:
+                    p3d_buffer_array = np.array(p3d_buffer)
 
-                    viz_human.viewer["/Background"].set_property("top_color", [1, 1, 1])  # Dark gray (RGB values in [0, 1])
-                    viz_human.viewer["/Background"].set_property("bottom_color", [0.65, 0.65, 0.65])  # Same color → flat background
+                    # Filter keypoints in world to remove noisy artefacts 
+                    filtered_p3d_buffer = iir_filter.filter(np.reshape(p3d_buffer_array,(settings.N, 3*len(settings.marker_names))))
+                    filtered_p3d_buffer = np.reshape(filtered_p3d_buffer,(settings.N, len(settings.marker_names), 3))
 
-                    # viz_human.display(pin.neutral(human_model))
-                    # # show debug frames at neutral configuration
-                    # dbg_q0 = pin.neutral(human_model)
-                    # # dbg_vis is created a bit later (after background), so we'll update after it's created
-                    # # DEBUG: display joint frames + marker frames + model marker positions
-                    # dbg_vis = setup_debug_visuals(vis, human_model, settings.marker_names, triad_length=0.08)
-                    # update_debug_visuals(vis, human_model, human_data, dbg_q0, dbg_vis)
-                    # input()
+                    augmented_markers=filtered_p3d_buffer[-1]
 
-                    # IK
-                    if settings.ik_type == 'sbs':
-                        omega = {}
-                        for key in settings.keys_to_track_list:
-                            omega[key] = 1
-                        q = pin.neutral(human_model)
-                        ik_class = RT_IK(human_model, mks_dict, q, settings.keys_to_track_list, settings.dt, omega)
+                    # VISUALISATION OF AUGMENTED MARKERS in RED
+                    colors = np.zeros_like(augmented_markers.T)
+                    colors[0, :] = 1.0  # R
+                    colors[1, :] = 0.0  # G
+                    colors[2, :] = 0.0  # B
 
-                        q = ik_class.solve_ik_sample_casadi()
-                        ik_class._q0 = q
-                        viz_human.display(q)
+                    vis_markers.set_object(
+                        g.PointCloud(position=augmented_markers.T, color=colors, size=0.02)
+                    )
 
-                        # Recalibrate briefly the markers translation in joint frames
-                        human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,settings.marker_names)
-                        human_data=human_model.createData()
+                    if first_sample:
+                        mks_dict = dict(zip(settings.marker_names, augmented_markers))
 
-                        ik_class = RT_IK(human_model, mks_dict, q, settings.keys_to_track_list, settings.dt, omega)
-                        LOGGER.info("[INFO] Model calibration finished, ready to process...")
+                        human = robex.human.HumanLoader(height=settings.human_height, weight=settings.human_weight, gender=settings.human_gender).robot
+                        human_model = human.model
+                        human_collision_model = human.collision_model
+                        human_visual_model = human.visual_model
 
-                    elif settings.ik_type == 'mhe':
-                        ik_class = RT_SWIKA(human_model, settings.keys_to_track_list, settings.N, code = settings.ik_code)
+                        #scale the model to data
+                        human_model = scale_human_model(human_model, mks_dict, gender=settings.human_gender, subject_height=settings.human_height)
+                        human_model= mks_registration(human_model, mks_dict, gender=settings.human_gender, subject_height=settings.human_height)
+                        # human_data = pin.Data(human_model)
 
-                        x_array = np.zeros((human_model.nq+human_model.nv, settings.N))
-                        x_array[6,:]=1
-                        u_array = np.zeros((human_model.nv, settings.N))
-                        deque_lstm_dict = deque(maxlen=settings.N)
-                        for k in range(settings.N):
-                            deque_lstm_dict.append(mks_dict)
-
-                        array_data = np.array([np.hstack([d[marker] for marker in settings.keys_to_track_list]) for d in deque_lstm_dict]).T
-
-                        x_array, u_array = ik_class.solve(x_array, u_array, array_data, x_array[:,-1], settings.cost_weights, settings.dt)
-
-                        q = pin.neutral(human_model)
-                        q[:] = np.array(x_array[:human_model.nq,-1]).flatten()
-                        viz_human.display(q)
-
-                        # Recalibrate briefly the markers translation in joint frames
-                        human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,settings.marker_names)
-                        human_data=human_model.createData()
-
-                        ik_class = RT_SWIKA(human_model, settings.keys_to_track_list, settings.N, code = settings.ik_code)
-                        LOGGER.info("[INFO] Model calibration finished, ready to process...")
-                    else : 
-                        raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")
-
-                    first_sample = False
-
-                else: # Init phase finished
-                    mks_dict = dict(zip(settings.marker_names, augmented_markers))
-
-                    # IK directly 
-                    if settings.ik_type == 'sbs':
-                        ik_class._dict_m = mks_dict
-                        q = ik_class.solve_ik_sample_quadprog() 
-                        ik_class._q0 = q
-                        viz_human.display(q)
-                    elif settings.ik_type == 'mhe':
-                        deque_lstm_dict.append(mks_dict)
-                        array_data = np.array([np.hstack([d[marker] for marker in settings.keys_to_track_list]) for d in deque_lstm_dict]).T
+                        # Init meshcat viewer for human
+                        # Visualizers
+                        viz_human = MeshcatVisualizer(human_model, human_collision_model, human_visual_model)
+                        viz_human.initViewer(vis, open=True)
                         
-                        x_array, u_array = ik_class.solve(x_array, u_array, array_data, x_array[:,-1], settings.cost_weights, settings.dt)
+                        # Don't delete the whole Meshcat tree: keep '/markers' etc.
+                        try:
+                            vis["ref"].delete()
+                        except Exception:
+                            pass
+                        viz_human.loadViewerModel("ref")
 
-                        q = pin.neutral(human_model)
-                        q[:] = np.array(x_array[:human_model.nq,-1]).flatten()
-                        viz_human.display(q)
-                    else : 
-                        raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")
-            t1=time.perf_counter()
-            #print(f"Time elapsed for treating one frame = {t1-t0} ms")
+                        viz_human.viewer["/Background"].set_property("top_color", [1, 1, 1])  # Dark gray (RGB values in [0, 1])
+                        viz_human.viewer["/Background"].set_property("bottom_color", [0.65, 0.65, 0.65])  # Same color → flat background
+
+                        # viz_human.display(pin.neutral(human_model))
+                        # # show debug frames at neutral configuration
+                        # dbg_q0 = pin.neutral(human_model)
+                        # # dbg_vis is created a bit later (after background), so we'll update after it's created
+                        # # DEBUG: display joint frames + marker frames + model marker positions
+                        # dbg_vis = setup_debug_visuals(vis, human_model, settings.marker_names, triad_length=0.08)
+                        # update_debug_visuals(vis, human_model, human_data, dbg_q0, dbg_vis)
+                        # input()
+
+                        # IK
+                        if settings.ik_type == 'sbs':
+                            omega = {}
+                            for key in settings.keys_to_track_list:
+                                omega[key] = 1
+                            q = pin.neutral(human_model)
+                            ik_class = RT_IK(human_model, mks_dict, q, settings.keys_to_track_list, settings.dt, omega)
+
+                            q = ik_class.solve_ik_sample_casadi()
+                            ik_class._q0 = q
+                            viz_human.display(q)
+
+                            # Recalibrate briefly the markers translation in joint frames
+                            human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,settings.marker_names)
+                            human_data=human_model.createData()
+
+                            ik_class = RT_IK(human_model, mks_dict, q, settings.keys_to_track_list, settings.dt, omega)
+                            LOGGER.info("[INFO] Model calibration finished, ready to process...")
+
+                        elif settings.ik_type == 'mhe':
+                            ik_class = RT_SWIKA(human_model, settings.keys_to_track_list, settings.N, code = settings.ik_code)
+
+                            x_array = np.zeros((human_model.nq+human_model.nv, settings.N))
+                            x_array[6,:]=1
+                            u_array = np.zeros((human_model.nv, settings.N))
+                            deque_lstm_dict = deque(maxlen=settings.N)
+                            for k in range(settings.N):
+                                deque_lstm_dict.append(mks_dict)
+
+                            array_data = np.array([np.hstack([d[marker] for marker in settings.keys_to_track_list]) for d in deque_lstm_dict]).T
+
+                            x_array, u_array = ik_class.solve(x_array, u_array, array_data, x_array[:,-1], settings.cost_weights, settings.dt)
+
+                            q = pin.neutral(human_model)
+                            q[:] = np.array(x_array[:human_model.nq,-1]).flatten()
+                            viz_human.display(q)
+
+                            # Recalibrate briefly the markers translation in joint frames
+                            human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,settings.marker_names)
+                            human_data=human_model.createData()
+
+                            ik_class = RT_SWIKA(human_model, settings.keys_to_track_list, settings.N, code = settings.ik_code)
+                            LOGGER.info("[INFO] Model calibration finished, ready to process...")
+                        else : 
+                            raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")
+
+                        first_sample = False
+
+                    else: # Init phase finished
+                        mks_dict = dict(zip(settings.marker_names, augmented_markers))
+
+                        # IK directly 
+                        if settings.ik_type == 'sbs':
+                            ik_class._dict_m = mks_dict
+                            q = ik_class.solve_ik_sample_quadprog() 
+                            ik_class._q0 = q
+                            viz_human.display(q)
+                        elif settings.ik_type == 'mhe':
+                            deque_lstm_dict.append(mks_dict)
+                            array_data = np.array([np.hstack([d[marker] for marker in settings.keys_to_track_list]) for d in deque_lstm_dict]).T
+                            
+                            x_array, u_array = ik_class.solve(x_array, u_array, array_data, x_array[:,-1], settings.cost_weights, settings.dt)
+
+                            q = pin.neutral(human_model)
+                            q[:] = np.array(x_array[:human_model.nq,-1]).flatten()
+                            viz_human.display(q)
+                        else : 
+                            raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")
+                t1=time.perf_counter()
+
+                frame_counter+=1
+
+                #print(f"Time elapsed for treating one frame = {t1-t0} ms")
+            end_time = time.perf_counter()
+            elapsed_time = end_time - start_time
+
+         
+        except KeyboardInterrupt:
+            end_time = time.perf_counter()
+            elapsed_time = end_time - start_time
+
+            print("\n--- BENCHMARK RESULTS ---")
+            print(f"Total Video Frames   : {total_frames}")
+            print(f"Total Processing Time: {elapsed_time:.2f} seconds")
+            print(f"Full Pipeline Speed  : {total_frames / elapsed_time:.2f} FPS")
+            print(f"Average Frame Latency: {(elapsed_time / total_frames) * 1000:.2f} ms")
+            print("---------------------------------------\n")
+            src.release()
+
+        finally:
+            end_time = time.perf_counter()
+            elapsed_time = end_time - start_time
+
+            print("\n--- BENCHMARK RESULTS ---")
+            print(f"Total Video Frames   : {total_frames}")
+            print(f"Total Processing Time: {elapsed_time:.2f} seconds")
+            print(f"Full Pipeline Speed  : {total_frames / elapsed_time:.2f} FPS")
+            print(f"Average Frame Latency: {(elapsed_time / total_frames) * 1000:.2f} ms")
+            print("---------------------------------------\n")
+            src.release()
 
 
 if __name__ == "__main__":
+    
     p = argparse.ArgumentParser()
     p.add_argument("--online", action="store_true")
     p.add_argument("--data-dir", type=str, default="data", help="Folder containing input videos")
