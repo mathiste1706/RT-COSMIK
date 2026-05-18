@@ -179,7 +179,18 @@ def load_camera_parameters(config_path):
     K1, D1 = load_cam_params(os.path.join(config_path, "c0_params_color.yaml"))
     K2, D2 = load_cam_params(os.path.join(config_path, "c2_params_color.yaml"))
     R, translation_matrix = load_cam_to_cam_params(os.path.join(config_path, "c0_to_c2_params_color.yaml"))
-    return K1, D1, K2, D2, R, translation_matrix
+
+    K_matrix_list=[np.array(K1), np.array(K2)]
+    Distortion_matrix_list=[D1,D2]
+
+    rotation_matrix_list=[np.eye(3), np.array(R)]
+    translation_matrix_list=[np.zeros((3,1)), np.array(translation_matrix)]
+
+    proj_camera1 = np.concatenate([rotation_matrix_list[0], translation_matrix_list[0]], axis=-1)
+    proj_camera2 = np.concatenate([rotation_matrix_list[1], translation_matrix_list[1]], axis=-1)
+    proj_camera_list=[proj_camera1, proj_camera2]
+
+    return K_matrix_list, Distortion_matrix_list, proj_camera_list, rotation_matrix_list, translation_matrix_list
 
 def load_world_transformation(config_path):
     """
