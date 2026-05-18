@@ -254,7 +254,7 @@ class OfflineVideoSource:
            
             command = [
                 'ffmpeg',
-                '-hwaccel', 'auto',
+                '-hwaccel', 'auto',        # Use hardware acceleration if available
                 '-loglevel', 'error',
                 '-stream_loop', '-1',      # Infinite looping
                 '-i', str(p),
