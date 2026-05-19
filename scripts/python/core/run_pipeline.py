@@ -8,8 +8,6 @@ if str(SRC_ROOT) not in sys.path:
 import argparse
 
 import time
-from pathlib import Path
-from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 import meshcat
@@ -17,9 +15,6 @@ import meshcat.geometry as g
 import meshcat.transformations as tf
 
 import json
-from queue import Queue, Full, Empty
-import threading
-import os
 
 import subprocess
 import numpy as np
@@ -38,6 +33,8 @@ from rtcosmik.camera.camera import Camera
 from rtcosmik.utils.mp_utils import create_camera_shared_ressources, create_pipeline_shared_ressources
 from rtcosmik.pipeline.pipeline import PipelineProcess
 from rtcosmik.viewer.viewer import ViewerProcess
+
+from rtcosmik.utils.videoReader import OfflineVideoSource
 
 from multiprocessing import set_start_method
 from collections import deque
@@ -221,167 +218,6 @@ def list_videos(data_dir: Path) -> List[Path]:
         raise FileNotFoundError(f"data dir does not exist: {data_dir.resolve()}")
     vids = [p for p in sorted(data_dir.iterdir()) if p.suffix.lower() in [".mp4"]]
     return vids
-
-
-
-@dataclass
-class OfflineVideoSource:
-    paths: List[Path]
-    size_wh: Tuple[int, int]
-    queue_size: int = 2  # Small queue keeps memory footprint low and frames fresh
-    
-    # Internal engine tracking
-    _procs: List[subprocess.Popen] = field(default_factory=list, init=False)
-    _queue: Queue = field(init=False)
-    _running: bool = field(default=False, init=False)
-    _threads: List[threading.Thread] = field(default_factory=list, init=False)
-
-    def __post_init__(self):
-        # The queue holds our pre-allocated frame memory structures
-        self._queue = Queue(maxsize=self.queue_size)
-
-    def _start_pipes(self):
-        self.release()
-        self._running = True
-        w, h = self.size_wh
-        frame_size = w * h * 3
-        clean_env = os.environ.copy()
-        
-        for key in list(clean_env.keys()):
-            if "VSCODE" in key:
-                clean_env.pop(key)
-
-        for stream_idx, p in enumerate(self.paths):
-            command = [
-                'ffmpeg',
-                '-loglevel', 'error',
-                "-hwaccel", 'auto',
-                '-stream_loop', '-1',      
-                '-i', str(p),
-                '-vf', f'scale={w}:{h}',   
-                '-f', 'image2pipe',
-                '-vcodec', 'rawvideo',
-                '-pix_fmt', 'bgr24',
-                '-blocksize', str(frame_size), 
-                '-'
-            ]
-            
-            proc = subprocess.Popen(
-                command, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.DEVNULL,
-                bufsize=frame_size,
-                env=clean_env
-            )  
-            self._procs.append(proc)
-
-            # Spin up a dedicated high-speed extraction thread for this specific stream pipe
-            t = threading.Thread(
-                target=self._pipe_reader_worker, 
-                args=(stream_idx, proc, frame_size), 
-                daemon=True
-            )
-            t.start()
-            self._threads.append(t)
-
-    def _pipe_reader_worker(self, stream_idx: int, proc: subprocess.Popen, frame_size: int):
-        """High-speed background worker that pulls raw bytes instantly from the OS kernel."""
-        w, h = self.size_wh
-        
-        while self._running and proc.poll() is None:
-            try:
-                # 1. Allocate block space specifically for this frame item
-                frame_buffer = np.empty((h, w, 3), dtype=np.uint8)
-                bytes_read = proc.stdout.readinto(frame_buffer)
-                
-                if bytes_read == 0 or bytes_read is None:
-                    continue # Let standard stream looping handle resets
-                
-                # 2. Fast-stitch chunks if the Linux OS kernel pipe fragments the frame
-                while bytes_read < frame_size and self._running:
-                    remaining_view = memoryview(frame_buffer)[bytes_read:]
-                    extra_bytes = proc.stdout.readinto(remaining_view)
-                    if extra_bytes == 0 or extra_bytes is None:
-                        break
-                    bytes_read += extra_bytes
-
-                if bytes_read == frame_size and self._running:
-                    # 3. Push to queue. If queue is full, block until GPU frees a slot.
-                    # This self-throttles the CPU so it doesn't leak memory.
-                    while self._running:
-                        try:
-                            self._queue.put((stream_idx, frame_buffer), timeout=0.1)
-                            break
-                        except Full:
-                            continue
-
-            except Exception:
-                break
-
-    def read(self) -> Optional[List[np.ndarray]]:
-        # Lazy Start tracking
-        if not self._procs:
-            self._start_pipes()
-
-        # Create a placeholder list to assemble frames from all streams
-        assembled_frames = [None] * len(self.paths)
-        filled_slots = 0
-
-        # Collect one fresh frame from each running background worker
-        while filled_slots < len(self.paths) and self._running:
-            try:
-                # Pop data from the worker thread pipeline
-                stream_idx, frame = self._queue.get(timeout=1.0)
-                
-                # Double check to prevent writing to out-of-bounds indices
-                if assembled_frames[stream_idx] is None:
-                    assembled_frames[stream_idx] = frame
-                    filled_slots += 1
-                else:
-                    # If we got a duplicate frame index before completing the set, 
-                    # put it back or cycle forward depending on synchronization needs.
-                    pass
-                self._queue.task_done()
-            except Empty:
-                return None
-
-        return assembled_frames if self._running else None
-
-    def release(self):
-        """Thread-safe breakdown shutdown sequence."""
-        self._running = False
-        
-        # 1. Force kill processes to instantly break the worker block loops
-        for proc in self._procs:
-            try:
-                if proc and proc.poll() is None:
-                    proc.terminate()
-            except Exception:
-                pass
-
-        # 2. Re-join background workers
-        for t in self._threads:
-            if t.is_alive():
-                t.join(timeout=0.1)
-
-        # 3. Clean close stdout pipelines safely
-        for proc in self._procs:
-            try:
-                if proc and proc.stdout:
-                    proc.stdout.close()
-            except Exception:
-                pass
-
-        # 4. Clear memory storage queues
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except Empty:
-                break
-
-        self._procs = []
-        self._threads = []
 
 def main(args):
 

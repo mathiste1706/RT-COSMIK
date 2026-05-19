@@ -9,12 +9,10 @@ if str(SRC_ROOT) not in sys.path:
 import argparse
 
 import time
-from pathlib import Path
-from dataclasses import dataclass, field
-import subprocess
-from typing import List, Optional, Sequence, Tuple
+from typing import List
 
 import cv2
+
 import numpy as np
 import torch
 from rtcosmik.nlf.nlf import NLFEstimator, DisplayConsumerNLF
@@ -22,6 +20,8 @@ from rtcosmik.config_loader import settings
 from rtcosmik.camera.cam_utils import list_cameras, load_camera_parameters
 from rtcosmik.camera.camera import Camera
 from rtcosmik.utils.mp_utils import create_camera_shared_ressources
+
+from rtcosmik.utils.videoReader import OfflineVideoSource
 
 from multiprocessing import set_start_method
 
@@ -39,72 +39,7 @@ def list_videos(data_dir: Path) -> List[Path]:
     vids = [p for p in sorted(data_dir.iterdir()) if p.suffix.lower() in [".mp4"]]
     return vids
 
-@dataclass
-class OfflineVideoSource:
-    paths: List[Path]
-    size_wh: Tuple[int, int]
-    points_saved: bool = False
-    # Internal storage for processes
-    _procs: List[subprocess.Popen] = field(default_factory=list, init=False)
 
-    def __post_init__(self):
-        self._start_pipes()
-
-    def _start_pipes(self):
-        """Initializes or restarts the FFmpeg subprocesses."""
-        self.release() # Ensure old pipes are closed
-        w, h = self.size_wh
-        
-        for p in self.paths:
-            command = [
-                'ffmpeg',
-                '-loglevel', 'error',
-                '-stream_loop', '-1',      # Infinite looping
-                '-i', str(p),
-                '-vf', f'scale={w}:{h}',   
-                '-f', 'image2pipe',
-                '-pix_fmt', 'bgr24',         
-                '-vcodec', 'rawvideo',
-                '-'
-            ]
-            proc = subprocess.Popen(command, stdout=subprocess.PIPE, bufsize=w * h * 3)
-            self._procs.append(proc)
-
-    def read(self) -> Optional[List[np.ndarray]]:
-        frames: List[np.ndarray] = []
-        w, h = self.size_wh
-        frame_size = w * h * 3
-
-        for i, proc in enumerate(self._procs):
-            try:
-                raw_frame = proc.stdout.read(frame_size)
-                
-                # Check if we got a full frame
-                if len(raw_frame) != frame_size:
-                    # If we get 0 bytes, the video ended. 
-                    # If we get > 0 but < frame_size, the pipe broke.
-                    self.points_saved = True
-                    self._start_pipes() 
-                    return self.read()
-
-                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((h, w, 3))
-                frames.append(frame)
-            except Exception as e:
-                print(f"Pipe error: {e}")
-                return None
-                
-        return frames
-
-    def release(self):
-        for proc in self._procs:
-            if proc.poll() is None: # Process is still running
-                proc.stdout.close() # Close stdout first
-                proc.terminate()    # Then terminate
-                try:
-                    proc.wait(timeout=0.5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        self._procs = []
 
 def main(args):
 
@@ -174,6 +109,14 @@ def main(args):
             paths = list_videos(Path(args.data_dir))
         if len(paths) == 0:
             raise RuntimeError(f"No videos found in {args.data_dir}")
+        
+        '''
+        To save output videos to check if they are synchronized
+        fps=40
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out_stream1 = cv2.VideoWriter('sync_check_video1.mp4', fourcc, fps, (W, H))
+        out_stream2 = cv2.VideoWriter('sync_check_video2.mp4', fourcc, fps, (W, H))
+        '''
 
         src = OfflineVideoSource(paths=paths, size_wh=(W, H))
 
@@ -192,10 +135,17 @@ def main(args):
 
         cv2.namedWindow("Visualization", cv2.WINDOW_NORMAL)
 
+        
         while True:
             frames = src.read()
             if frames is None:
                 break
+            
+            '''
+            To save output videos to check if they are synchronized
+            out_stream1.write(frames[0])
+            out_stream2.write(frames[1])
+            '''
 
             nlf_out, infer_ms, yres, boxes = est.estimate_from_frames(frames)
 
@@ -218,6 +168,12 @@ def main(args):
                 break
 
         src.release()
+        
+        '''
+        To save output videos to check if they are synchronized
+        out_stream1.release()
+        out_stream2.release()
+        '''
         cv2.destroyAllWindows()
 
 

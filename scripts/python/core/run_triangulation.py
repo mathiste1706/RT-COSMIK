@@ -8,9 +8,7 @@ if str(SRC_ROOT) not in sys.path:
 import argparse
 
 import time
-from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List
 
 import meshcat
 import meshcat.geometry as g
@@ -18,7 +16,6 @@ import meshcat.transformations as tf
 
 import json
 
-import cv2
 import numpy as np
 import torch
 from rtcosmik.nlf.nlf import NLFEstimator, DisplayConsumerNLF
@@ -27,6 +24,8 @@ from rtcosmik.camera.cam_utils import list_cameras, load_camera_parameters, load
 from rtcosmik.camera.camera import Camera
 from rtcosmik.utils.mp_utils import create_camera_shared_ressources
 from rtcosmik.triangulation.triangulation import triangulate_points
+
+from rtcosmik.utils.videoReader import OfflineVideoSource
 
 from multiprocessing import set_start_method
 
@@ -45,38 +44,6 @@ def list_videos(data_dir: Path) -> List[Path]:
         raise FileNotFoundError(f"data dir does not exist: {data_dir.resolve()}")
     vids = [p for p in sorted(data_dir.iterdir()) if p.suffix.lower() in [".mp4"]]
     return vids
-
-@dataclass
-class OfflineVideoSource:
-    points_saved=False
-    paths: List[Path]
-    size_wh: Tuple[int, int]
-
-    def __post_init__(self):
-        self.caps = [cv2.VideoCapture(str(p)) for p in self.paths]
-        for p, cap in zip(self.paths, self.caps):
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open video: {p}")
-
-    def read(self) -> Optional[List[np.ndarray]]:
-        frames: List[np.ndarray] = []
-        for cap in self.caps:
-            ok, frame = cap.read()
-            if not ok:
-                self.points_saved=True
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok, frame = cap.read()
-                if not ok:
-                    return None
-            W, H = self.size_wh
-            if frame.shape[1] != W or frame.shape[0] != H:
-                frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_LINEAR)
-            frames.append(frame)
-        return frames
-
-    def release(self):
-        for cap in self.caps:
-            cap.release()
 
 def main(args):
 
