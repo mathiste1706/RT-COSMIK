@@ -20,3 +20,6 @@ data/
 *.egg-info/
 build/
 dist/
+scripts/python/core/sync_check_video2.mp4
+scripts/python/core/point_saved.json
+scripts/python/core/sync_check_video1.mp4
