@@ -222,11 +222,7 @@ def list_videos(data_dir: Path) -> List[Path]:
     vids = [p for p in sorted(data_dir.iterdir()) if p.suffix.lower() in [".mp4"]]
     return vids
 
-import subprocess
-import numpy as np
-from pathlib import Path
-from typing import List, Tuple, Optional
-from dataclasses import dataclass, field
+
 
 @dataclass
 class OfflineVideoSource:
