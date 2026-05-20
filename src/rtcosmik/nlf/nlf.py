@@ -56,7 +56,7 @@ class NLFEstimator:
 
         self.geom_dtype = torch.float32
         K_stack = np.stack(cam_Ks, axis=0) 
-        self.Kt = torch.from_numpy(K_stack).to(self.device, dtype=self.geom_dtype)  # (C,3,3)
+        self.Kt = torch.from_numpy(K_stack).to(self.device, dtype=self.geom_dtype)  # (C,3,3)F
 
         self.C = self.Kt.shape[0]
         # Per-camera lock state to keep tracking the same person across frames.
@@ -120,6 +120,7 @@ class NLFEstimator:
                     frames, imgsz=self.imgsz, classes=0, conf=self.conf,
                     device=self.device, verbose=False, half=True,
                 )
+
 
         with torch.inference_mode():
             imgs = self.preprocess_batch(frames)  # (C,3,H,W)

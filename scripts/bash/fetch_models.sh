@@ -64,7 +64,7 @@ download_release_asset "${YOLO_OWNER}" "${YOLO_REPO}" "${YOLO_TAG}" "${YOLO_ASSE
 
 # -------- Export to TensorRT engine (fixed imgsz=640, batch=2, not dynamic) --------
 DEVICE="${DEVICE:-0}"
-BATCH=2
+BATCH=4
 IMGSZ=640
 ENGINE_OUT="${YOLO_DIR}/yolov10n_b${BATCH}_img${IMGSZ}_fp16.engine"
 
@@ -100,7 +100,7 @@ yolo export \
   format=engine \
   device="${DEVICE}" \
   imgsz=640 \
-  batch=2 \
+  batch=${BATCH} \
   dynamic=False \
   simplify=False | tee "${LOG}"
 

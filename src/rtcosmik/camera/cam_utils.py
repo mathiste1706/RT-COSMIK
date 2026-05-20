@@ -162,35 +162,58 @@ def load_cam_pose(filename):
     
     return rotation_matrix, translation_matrix
 
-
-def load_camera_parameters(config_path):
+def load_camera_parameters(config_path, num_cameras=2):
     """
-    Load intrinsic and extrinsic camera parameters from a file.
+    Loads camera parameters for 2, or 4 cameras.
+    
     Parameters:
-        config_path (str): The path to the configuration file.
+        config_path (str): Path to the configuration directory.
+        num_cameras (int): Total number of physical cameras (must be even and >= 2).
+
     Returns:
-        K1: the camera intrinsic matrix of camera 0.
-        D1: the camera distortion matrix of camera 0.
-        K2: the camera extrinsic matrix of camera 2.
-        D2: the camera distortion matrix of camera 2.
-        R: the rotation matrix between camera 0 and camera 2.
-        translation_matrix: the translation matrix between camera 0 and camera 2.
+        mtx_list (list of np.ndarray): Camera matrices, each with shape (3, 3)
+        dist_list (list of np.ndarray): Camera distortion coefficients, each with shape (1, 5)
+        projection_list (list of np.ndarray): Projection matrices [R | T], each with shape (3, 4).
+        rotation_list (list of np.ndarray): Camera rotation matrices, each with shape (3, 3).
+        translation_list (list of np.ndarray): Camera translation matrices, each with shape (3, 1).
     """
-    K1, D1 = load_cam_params(os.path.join(config_path, "c0_params_color.yaml"))
-    K2, D2 = load_cam_params(os.path.join(config_path, "c2_params_color.yaml"))
-    R, translation_matrix = load_cam_to_cam_params(os.path.join(config_path, "c0_to_c2_params_color.yaml"))
+    if num_cameras % 2 != 0 or num_cameras < 2:
+        raise ValueError("Number of cameras must be an even integer greater than or equal to 2.")
 
-    K_matrix_list=[np.array(K1), np.array(K2)]
-    Distortion_matrix_list=[D1,D2]
+    cam_order = [f"c{i}" for i in range(0, num_cameras * 2, 2)]
+    
+    mtx_list = []
+    dist_list = []
+    rotation_list = []
+    translation_list = []
+    projection_list = []
 
-    rotation_matrix_list=[np.eye(3), np.array(R)]
-    translation_matrix_list=[np.zeros((3,1)), np.array(translation_matrix)]
+    for i, cam in enumerate(cam_order):
+        
+        K, D = load_cam_params(os.path.join(config_path, f"{cam}_params_color.yaml"))
+        mtx_list.append(np.array(K))
+        dist_list.append(D)
 
-    proj_camera1 = np.concatenate([rotation_matrix_list[0], translation_matrix_list[0]], axis=-1)
-    proj_camera2 = np.concatenate([rotation_matrix_list[1], translation_matrix_list[1]], axis=-1)
-    proj_camera_list=[proj_camera1, proj_camera2]
+        if i == 0:
+            # The first camera (c0) acts as the world origin
+            R = np.eye(3)
+            translation = np.zeros((3, 1))
+        else:
+            # Subsequent cameras read the chaining file (e.g., c0_to_c2, c2_to_c4, c4_to_c6)
+            prev_cam = cam_order[i - 1]
+            extrinsic_file = os.path.join(config_path, f"{prev_cam}_to_{cam}_params_color.yaml")
+            R, translation = load_cam_to_cam_params(extrinsic_file)
+            
+            R = np.array(R)
+            translation = np.array(translation).reshape(3, 1) # Force standard 3x1 vertical vector layout
 
-    return K_matrix_list, Distortion_matrix_list, proj_camera_list, rotation_matrix_list, translation_matrix_list
+        rotation_list.append(R)
+        translation_list.append(translation)
+
+        projection = np.concatenate([R, translation], axis=-1)
+        projection_list.append(projection)
+
+    return mtx_list, dist_list, projection_list, rotation_list, translation_list
 
 def load_world_transformation(config_path):
     """

@@ -232,7 +232,7 @@ def main(args):
     # Determine size
     W = settings.width
     H = settings.height
-    mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path)
+    mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, 4)
     world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
     
     if args.online:
