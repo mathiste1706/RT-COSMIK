@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 def read_subject_yaml(file_path):
     """
-    Lit un fichier YAML et retourne directement id, height, weight et gender.
+    Read a YAML file and returns id, height, weight and gender.
     """
     with open(file_path, 'r') as f:
         data = yaml.safe_load(f)
@@ -429,11 +429,12 @@ def read_mmpose_file(nom_fichier):
 
 def read_mmpose_file_clean(filepath, num_keypoints=26, max_lines=360):
     """
-    Lit un fichier CSV de keypoints 2D MMPose.
-    - Garde seulement les 26 premiers keypoints (52 colonnes)
-    - Gère les NaNs
-    - Ne lit que les `max_lines` premières lignes
-    - Retourne un tableau (n_frames, num_keypoints, 2)
+    Read a CSV file of 2D MMPose keypoints
+        - Keep only the 26 first keypoints (52 columns)
+        - Handles NaNs
+        - Read only the 'max_lines' first lines
+    Returns
+        table of (n_frames, num_keypoints, 2) dimensions
     """
     donnees = []
     with open(filepath, 'r') as f:
