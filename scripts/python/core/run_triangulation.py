@@ -15,6 +15,7 @@ import meshcat.geometry as g
 import meshcat.transformations as tf
 
 import json
+import subprocess
 
 import numpy as np
 import torch
@@ -48,7 +49,9 @@ def list_videos(data_dir: Path) -> List[Path]:
 def main(args):
 
     p3d_file=[]
-    first_run_points_saved=True
+    first_run_not_finished=True
+    points_saved=False
+    frame_counter=0
 
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -143,6 +146,18 @@ def main(args):
 
         NUM_CAMERAS = len(paths)
 
+        """Uses ffprobe to read the total number of frames from the video header."""
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=nb_frames',
+            '-of', 'json', str(paths[0])
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        total_frames=int(data['streams'][0]['nb_frames'])
+        LOGGER.info(f"[INFO] Total frames determined from ffprobe: {total_frames}")
+
         src = OfflineVideoSource(paths=paths, size_wh=(W, H))
 
         est = NLFEstimator(
@@ -194,7 +209,7 @@ def main(args):
             if args.save:   # Works even if it's a string
                 p3d_file.append(p3d.tolist())
 
-                if src.points_saved and first_run_points_saved:
+                if points_saved and first_run_not_finished:
                         
                         if isinstance(args.save, str):
                             target_path=args.save
@@ -203,7 +218,7 @@ def main(args):
                         
                         with open(target_path, "w") as f:
                             json.dump(p3d_file, f)
-                            first_run_points_saved=False
+                            first_run_not_finished=False
                         print("\n\n SAVED")
 
             poses_triangul = torch.from_numpy(p3d).to(dtype=torch.float32)
@@ -237,6 +252,11 @@ def main(args):
             else:
                 vis_markers.delete()
                 vis_markers2.delete()
+            
+            frame_counter+=1
+            if args.save and frame_counter==total_frames-1:
+                points_saved=True
+                    
 
         src.release()
 
