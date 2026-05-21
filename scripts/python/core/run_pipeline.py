@@ -23,7 +23,7 @@ import pinocchio as pin
 from pinocchio.visualize import MeshcatVisualizer
 
 from rtcosmik.config_loader import settings
-from rtcosmik.nlf.nlf import NLFEstimator, DisplayConsumerNLF
+from rtcosmik.nlf.nlf import NLFEstimator, check_yolo_engine
 from rtcosmik.triangulation.triangulation import triangulate_points
 from rtcosmik.filtering.iir import IIR
 from rtcosmik.human_model.model_utils import scale_human_model, mks_registration, recalibrate_marker_frames_in_joint_space
@@ -239,6 +239,7 @@ def main(args):
         cameras = list_cameras()
         NUM_CAMERAS = len(cameras)
         FRAME_SHAPE = (H, W, 3)
+        check_yolo_engine(NUM_CAMERAS)
         camera_buffers, camera_timestamps, camera_locks, frame_counters, camera_barrier, stop_event = create_camera_shared_ressources(NUM_CAMERAS, FRAME_SHAPE)
         results_queues = create_pipeline_shared_ressources()
 

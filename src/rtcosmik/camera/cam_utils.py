@@ -179,8 +179,6 @@ def load_camera_parameters(config_path, num_cameras=2):
     """
     if num_cameras % 2 != 0 or num_cameras < 2:
         raise ValueError("Number of cameras must be an even integer greater than or equal to 2.")
-
-    cam_order = [f"c{i}" for i in range(0, num_cameras * 2, 2)]
     
     mtx_list = []
     dist_list = []
@@ -188,9 +186,10 @@ def load_camera_parameters(config_path, num_cameras=2):
     translation_list = []
     projection_list = []
 
-    for i, cam in enumerate(cam_order):
+    for i in range(num_cameras):
+        cam_nb = i * 2
         
-        K, D = load_cam_params(os.path.join(config_path, f"{cam}_params_color.yaml"))
+        K, D = load_cam_params(os.path.join(config_path, f"c{cam_nb}_params_color.yaml"))
         mtx_list.append(np.array(K))
         dist_list.append(D)
 
@@ -200,8 +199,8 @@ def load_camera_parameters(config_path, num_cameras=2):
             translation = np.zeros((3, 1))
         else:
             # Subsequent cameras read the chaining file (e.g., c0_to_c2, c2_to_c4, c4_to_c6)
-            prev_cam = cam_order[i - 1]
-            extrinsic_file = os.path.join(config_path, f"{prev_cam}_to_{cam}_params_color.yaml")
+            prev_cam_nb = (i - 1) * 2
+            extrinsic_file = os.path.join(config_path, f"c{prev_cam_nb}_to_c{cam_nb}_params_color.yaml")
             R, translation = load_cam_to_cam_params(extrinsic_file)
             
             R = np.array(R)

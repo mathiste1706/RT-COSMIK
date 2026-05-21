@@ -15,7 +15,7 @@ import cv2
 
 import numpy as np
 import torch
-from rtcosmik.nlf.nlf import NLFEstimator, DisplayConsumerNLF
+from rtcosmik.nlf.nlf import NLFEstimator, DisplayConsumerNLF, check_yolo_engine
 from rtcosmik.config_loader import settings
 from rtcosmik.camera.cam_utils import list_cameras, load_camera_parameters
 from rtcosmik.camera.camera import Camera
@@ -56,6 +56,7 @@ def main(args):
         cameras = list_cameras()
         NUM_CAMERAS = len(cameras)
         FRAME_SHAPE = (H, W, 3)
+        check_yolo_engine(NUM_CAMERAS)
         camera_buffers, camera_timestamps, camera_locks, frame_counters, camera_barrier, stop_event = create_camera_shared_ressources(NUM_CAMERAS, FRAME_SHAPE)
 
         # Create camera processes
@@ -109,6 +110,9 @@ def main(args):
             paths = list_videos(Path(args.data_dir))
         if len(paths) == 0:
             raise RuntimeError(f"No videos found in {args.data_dir}")
+        
+        NUM_CAMERAS=len(paths)
+        check_yolo_engine(NUM_CAMERAS)
         
         '''
         To save output videos to check if they are synchronized
