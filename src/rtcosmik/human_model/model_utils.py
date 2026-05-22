@@ -45,6 +45,11 @@ SGTS_MKS_MAPPING = {
     }
 
 def check_orthogonality(matrix: np.ndarray):
+    '''
+    Check orthogonality of matrix
+    Parameters:
+        matrix (np.ndarray): A matrix of [samples x channels]
+    '''
     # Vecteurs colonnes
     X = matrix[:3, 0]
     Y = matrix[:3, 1]
@@ -67,13 +72,26 @@ def check_orthogonality(matrix: np.ndarray):
     assert np.abs(dot_YZ) < tolerance, "Vectors Y and Z are not orthogonal"
 
 
-#Build inertia matrix from 6 inertia components
 def make_inertia_matrix(ixx:float, ixy:float, ixz:float, iyy:float, iyz:float, izz:float)->np.ndarray:
+    '''
+    Build inertia matrix from 6 inertia components
+    Parameters:
+        ixx, ixy, ixz, iyy, iyz, izz
+    Returns:
+        the inertia matrix formed by the 6 inertia components
+    '''
     return np.array([[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]])
 
-#Function that takes as input a matrix and orthogonalizes it
-#Its mainly used to orthogonalize rotation matrices constructed by hand
+
 def orthogonalize_matrix(matrix:np.ndarray)->np.ndarray:
+    '''
+    Function that takes as input a matrix and orthogonalizes it
+    It's mainly used to orthogonalize rotation matrices constructed by hand
+    Parameters:
+        matrix (np.ndarray): A matrix of [samples x channels]
+    Returns:
+        orthogonal_matrix (np.ndarray): the orthogonalized parameter matrix
+    '''
     # Perform Singular Value Decomposition
     U, _, Vt = np.linalg.svd(matrix)
     # Reconstruct the orthogonal matrix
@@ -85,7 +103,7 @@ def orthogonalize_matrix(matrix:np.ndarray)->np.ndarray:
     return orthogonal_matrix
 
 
-def get_left_upperarm_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_left_upperarm_pose(mks_positions):
     """
     Calculate the pose of the left upper arm based on  marker positions.
     This function computes the transformation matrix representing the pose of the left upper arm.
@@ -100,7 +118,6 @@ def get_left_upperarm_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z, shoulder_center = [], [], [], []
     torso_pose = get_torso_pose(mks_positions)
     bi_acromial_dist = np.linalg.norm(mks_positions['LSHO'] - mks_positions['RSHO'])
     shoulder_center = mks_positions['LSHO'].reshape(3,1) + (torso_pose[:3, :3].reshape(3,3) @ col_vector_3D(0.0, -0.17*bi_acromial_dist, 0.0)).reshape(3,1)
@@ -128,7 +145,7 @@ def get_left_upperarm_pose(mks_positions, gender='m', subject_height= 1.80):
     return pose
 
 #construct thigh frames and get their poses
-def get_right_upperleg_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_right_upperleg_pose(mks_positions, gender='m'):
     """
     Calculate the pose of the right thigh based on  marker positions.
     Parameters:
@@ -176,7 +193,7 @@ def get_right_upperleg_pose(mks_positions, gender='m', subject_height= 1.80):
     return pose
 
 
-def get_left_upperleg_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_left_upperleg_pose(mks_positions, gender='m'):
     """
     Calculate the pose of the left thigh based on  marker positions.
     Parameters:
@@ -196,8 +213,6 @@ def get_left_upperleg_pose(mks_positions, gender='m', subject_height= 1.80):
         ratio_z = 0.372
 
     pose = np.eye(4,4)
-    X, Y, Z = [], [], []
-    hip_center = np.zeros((3,1))
 
     dist_rPL_lPL = np.linalg.norm(mks_positions["LASI"]-mks_positions["RASI"])
     virtual_pelvis_pose = get_virtual_pelvis_pose(mks_positions)
@@ -221,40 +236,7 @@ def get_left_upperleg_pose(mks_positions, gender='m', subject_height= 1.80):
     pose[:3,:3] = orthogonalize_matrix(pose[:3,:3])
     return pose
 
-#construct shank frames and get their poses
-def get_right_lowerleg_pose(mks_positions, gender='m', subject_height= 1.80):
-    """
-    Calculate the pose of the right shank based on  marker positions.
-    Parameters:
-    mks_positions (dict): A dictionary containing the positions of  markers. 
-                                The keys should include 'RKNE', 'RMKNE', 
-                                'RMANK', 'RANK'.
-    Returns:
-    numpy.ndarray: A 4x4 transformation matrix representing the pose of the right shank. The matrix 
-                   includes rotation (in the top-left 3x3 submatrix) and translation (in the top-right 
-                   3x1 subvector).
-    """
-
-    pose = np.eye(4,4)
-    X, Y, Z, knee_center, ankle_center = [], [], [], [], []
-
-    knee_center = (mks_positions['RKNE'] + mks_positions['RMKNE']).reshape(3,1)/2.0
-    ankle_center = (mks_positions['RMANK'] + mks_positions['RANK']).reshape(3,1)/2.0
-    Y = knee_center - ankle_center
-    Y = Y/np.linalg.norm(Y)
-    Z = (mks_positions['RKNE'] - mks_positions['RMKNE']).reshape(3,1)
-    Z = Z/np.linalg.norm(Z)
-    X = np.cross(Y, Z, axis=0)
-    Z = np.cross(X, Y, axis=0)
-
-    pose[:3,0] = X.reshape(3,)
-    pose[:3,1] = Y.reshape(3,)
-    pose[:3,2] = Z.reshape(3,)
-    pose[:3,3] = knee_center.reshape(3,)
-    pose[:3,:3] = orthogonalize_matrix(pose[:3,:3])
-    return pose
-
-def get_left_lowerleg_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_left_lowerleg_pose(mks_positions):
     """
     Calculate the pose of the left shank based on  marker positions.
     Parameters:
@@ -267,7 +249,6 @@ def get_left_lowerleg_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z, knee_center, ankle_center = [], [], [], [], []
 
     knee_center = (mks_positions['LKNE'] + mks_positions['LMKNE']).reshape(3,1)/2.0
     ankle_center = (mks_positions['LMANK'] + mks_positions['LANK']).reshape(3,1)/2.0
@@ -286,7 +267,7 @@ def get_left_lowerleg_pose(mks_positions, gender='m', subject_height= 1.80):
     return pose
 
 #construct foot frames and get their poses
-def get_right_foot_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_right_foot_pose(mks_positions):
     """
     Calculate the pose of the right foot based on  marker positions.
     Parameters:
@@ -299,7 +280,6 @@ def get_right_foot_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z, ankle_center = [], [], [], []
 
     ankle_center = (mks_positions['RMANK'] + mks_positions['RANK']).reshape(3,1)/2.0
     toe_pos = (mks_positions['RTOE'] + mks_positions['R5MHD'])/2.0
@@ -318,7 +298,7 @@ def get_right_foot_pose(mks_positions, gender='m', subject_height= 1.80):
     pose[:3,:3] = orthogonalize_matrix(pose[:3,:3])
     return pose
 
-def get_left_foot_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_left_foot_pose(mks_positions):
     """
     Calculate the pose of the left foot based on  marker positions.
     This function computes the transformation matrix (pose) of the left foot using
@@ -339,7 +319,6 @@ def get_left_foot_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z, ankle_center = [], [], [], []
 
     ankle_center = (mks_positions['LMANK'] + mks_positions['LANK']).reshape(3,1)/2.0
     toe_pos = (mks_positions['LTOE'] + mks_positions['L5MHD'])/2.0
@@ -359,7 +338,7 @@ def get_left_foot_pose(mks_positions, gender='m', subject_height= 1.80):
     return pose
 
 #get_virtual_pelvis_pose, used to get thigh pose
-def get_virtual_pelvis_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_virtual_pelvis_pose(mks_positions):
     """
     Calculate the pelvis pose matrix from  marker positions.
     The function computes the pelvis pose based on the positions of specific markers.
@@ -375,9 +354,6 @@ def get_virtual_pelvis_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z = [], [], []
-    center_PSIS = []
-    center_ASIS = []
 
     center_PSIS = (mks_positions['RPSI'] + mks_positions['LPSI']).reshape(3,1)/2.0
     center_ASIS = (mks_positions['RASI'] + mks_positions['LASI']).reshape(3,1)/2.0
@@ -397,7 +373,7 @@ def get_virtual_pelvis_pose(mks_positions, gender='m', subject_height= 1.80):
     return pose
 
 
-def get_pelvis_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_pelvis_pose(mks_positions, gender='m'):
     """
     Calculate the pelvis pose matrix from  marker positions.
     The function computes the pelvis pose based on the positions of specific markers.
@@ -422,11 +398,6 @@ def get_pelvis_pose(mks_positions, gender='m', subject_height= 1.80):
         ratio_z = 0.0
 
     pose = np.eye(4,4)
-    center_PSIS = []
-    center_ASIS = []
-    center_right_ASIS_PSIS = []
-    center_left_ASIS_PSIS = []
-    LJC=np.zeros((3,1))
 
     dist_rPL_lPL = np.linalg.norm(mks_positions["RASI"]-mks_positions["LASI"])
     virtual_pelvis_pose = get_virtual_pelvis_pose(mks_positions)
@@ -444,7 +415,6 @@ def get_pelvis_pose(mks_positions, gender='m', subject_height= 1.80):
                                 +ratio_y * dist_rPL_lPL,
                                 ratio_z * dist_rPL_lPL
                                 )
-    LJC = LJC + virtual_pelvis_pose[:3, :3] @ offset_local
  
     X = center_ASIS - center_PSIS
     X = X/np.linalg.norm(X)
@@ -462,7 +432,7 @@ def get_pelvis_pose(mks_positions, gender='m', subject_height= 1.80):
 
     return pose
 
-def get_left_lowerarm_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_left_lowerarm_pose(mks_positions):
     """
     Calculate the pose of the left lower arm based on  marker positions.
     This function computes the transformation matrix representing the pose of the left lower arm.
@@ -476,7 +446,6 @@ def get_left_lowerarm_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z, elbow_center = [], [], [], []
     elbow_center = (mks_positions['LMELB'] + mks_positions['LELB']).reshape(3,1)/2.0
     wrist_center = (mks_positions['LMWRI'] + mks_positions['LWRI']).reshape(3,1)/2.0
     
@@ -504,7 +473,7 @@ def get_left_lowerarm_pose(mks_positions, gender='m', subject_height= 1.80):
 
 
 #construct upperarm frames and get their poses
-def get_right_upperarm_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_right_upperarm_pose(mks_positions):
     """
     Calculate the pose of the right upper arm based on  marker positions.
     Parameters:
@@ -517,7 +486,6 @@ def get_right_upperarm_pose(mks_positions, gender='m', subject_height= 1.80):
     """
     
     pose = np.eye(4,4)
-    X, Y, Z, shoulder_center = [], [], [], []
 
     torso_pose = get_torso_pose(mks_positions)
     bi_acromial_dist = np.linalg.norm(mks_positions['LSHO'] - mks_positions['RSHO'])
@@ -545,7 +513,7 @@ def get_right_upperarm_pose(mks_positions, gender='m', subject_height= 1.80):
 
 #construct abdomen frame and get its pose (middle thoracic joint in urdf)
 def get_thorax_pose(mks_positions, gender='m', subject_height= 1.80):
-    #pelvis + distance selon y
+
     """
     Calculate the abdomen pose matrix from  marker positions.
     The function computes the abdomen pose based on the positions of specific markers.
@@ -574,9 +542,7 @@ def get_thorax_pose(mks_positions, gender='m', subject_height= 1.80):
     p_global = (get_pelvis_pose(mks_positions,gender)[:3,:3].reshape(3,3) @ p_local).reshape(3,1)
     
     pose = np.eye(4,4)
-    X, Y, Z = [], [], []
-    center_PSIS = []
-    center_ASIS = []
+
 
     center_PSIS = (mks_positions['RPSI'] + mks_positions['LPSI']).reshape(3,1)/2.0
     center_ASIS = (mks_positions['RASI'] + mks_positions['LASI']).reshape(3,1)/2.0
@@ -600,7 +566,7 @@ def get_thorax_pose(mks_positions, gender='m', subject_height= 1.80):
     return pose
  
 
-def get_head_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_head_pose(mks_positions):
     """
     Calculate the pose of the head based on  marker positions.
     The function computes a 4x4 transformation matrix representing the pose of the head.
@@ -616,11 +582,8 @@ def get_head_pose(mks_positions, gender='m', subject_height= 1.80):
 
     pose = np.eye(4)
 
-    # default origin (your current behavior)
     shoulder_center = (mks_positions['RSHO'] + mks_positions['LSHO']) / 2.0
     head_center = shoulder_center
-
-    X = Y = Z = None
 
     if 'Head' in mks_positions:
         top_head = mks_positions['Head']
@@ -660,7 +623,7 @@ def get_head_pose(mks_positions, gender='m', subject_height= 1.80):
 
 
 #construct torso frame and get its pose from a dictionnary of mks positions and names
-def get_torso_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_torso_pose(mks_positions):
     """
     Calculate the torso pose matrix from  marker positions.
     The function computes a 4x4 transformation matrix representing the pose of the torso.
@@ -675,7 +638,6 @@ def get_torso_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z, trunk_center = [], [], [], []
 
     trunk_center = (mks_positions['RSHO'] + mks_positions['LSHO'])/2.0 
     midhip = (mks_positions['RASI'] +
@@ -698,7 +660,7 @@ def get_torso_pose(mks_positions, gender='m', subject_height= 1.80):
     pose[:3,:3] = orthogonalize_matrix(pose[:3,:3])
     return pose
 
-def get_right_lowerarm_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_right_lowerarm_pose(mks_positions):
     """
     Calculate the pose of the right lower arm based on  marker positions.
     The function computes the transformation matrix (pose) of the right lower arm using the positions of specific markers.
@@ -712,7 +674,6 @@ def get_right_lowerarm_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z, elbow_center = [], [], [], []
     elbow_center = (mks_positions['RMELB'] + mks_positions['RELB']).reshape(3,1)/2.0
     wrist_center = (mks_positions['RWRI'] + mks_positions['RMWRI']).reshape(3,1)/2.0
     
@@ -731,7 +692,7 @@ def get_right_lowerarm_pose(mks_positions, gender='m', subject_height= 1.80):
     return pose
 
 #construct shank frames and get their poses
-def get_right_lowerleg_pose(mks_positions, gender='m', subject_height= 1.80):
+def get_right_lowerleg_pose(mks_positions):
     """
     Calculate the pose of the right shank based on  marker positions.
     Parameters:
@@ -745,7 +706,6 @@ def get_right_lowerleg_pose(mks_positions, gender='m', subject_height= 1.80):
     """
 
     pose = np.eye(4,4)
-    X, Y, Z, knee_center, ankle_center = [], [], [], [], []
 
     knee_center = (mks_positions['RKNE'] + mks_positions['RMKNE']).reshape(3,1)/2.0
     ankle_center = (mks_positions['RMANK'] + mks_positions['RANK']).reshape(3,1)/2.0
@@ -764,7 +724,14 @@ def get_right_lowerleg_pose(mks_positions, gender='m', subject_height= 1.80):
     pose[:3,:3] = orthogonalize_matrix(pose[:3,:3])
     return pose
 
-def get_right_hand_pose(mks_positions, gender='m', subject_height=1.80):
+def get_right_hand_pose(mks_positions):
+    """
+    Calculate the pose of the right hand based on  marker positions.
+    Parameters:
+        mks_positions (dict): A dictionary containing the positions of  markers.
+    Returns:
+        pose (np.array): the right hand pose
+    """
     pose = np.eye(4, 4)
 
     wrist_center = ((mks_positions['RWRI'] + mks_positions['RMWRI']) / 2.0).reshape(3, 1)
@@ -790,7 +757,14 @@ def get_right_hand_pose(mks_positions, gender='m', subject_height=1.80):
     return pose
 
 
-def get_left_hand_pose(mks_positions, gender='m', subject_height=1.80):
+def get_left_hand_pose(mks_positions):
+    """
+    Calculate the pose of the left hand based on  marker positions.
+    Parameters:
+        mks_positions (dict): A dictionary containing the positions of  markers.
+    Returns:
+        pose (np.array): the left hand pose
+    """
     pose = np.eye(4, 4)
 
     wrist_center = ((mks_positions['LWRI'] + mks_positions['LMWRI']) / 2.0).reshape(3, 1)

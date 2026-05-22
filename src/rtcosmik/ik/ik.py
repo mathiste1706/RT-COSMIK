@@ -166,7 +166,11 @@ class RT_IK:
         return rmse
     
     def update_marker_estimates(self, q0):
-        """Update the estimated marker positions."""
+        """
+        Update the estimated marker positions.
+        Parameters:
+            q0 (np.ndarray): updated position of markers
+        """
         pin.forwardKinematics(self._model, self._data, q0)
         pin.updateFramePlacements(self._model, self._data)  
 
@@ -179,7 +183,11 @@ class RT_IK:
 
 
     def solve_ik_sample_quadprog(self)->np.ndarray:
-        """_Solve the ik optimisation problem : q* = argmin(||P_m - P_e||^2 + lambda|q_init - q|) st to q_min <= q <= q_max for a given sample _
+        """
+        Solve the ik optimisation problem : q* = argmin(||P_m - P_e||^2 + lambda|q_init - q|) st to q_min <= q <= q_max for a given sample
+        Returns:
+            q0: the solution of the ik optimisation problem
+
         """
 
         q0=pin.normalize(self._model,self._q0)
@@ -264,6 +272,11 @@ class RT_IK:
         return q0
     
     def solve_ik_sample_casadi(self)->np.ndarray:
+        """
+        Solve the ik optimisation problem  using casadi.
+        Returns:
+            q0: the solution of the ik optimisation problem
+        """
         # Casadi optimization class
         opti = casadi.Opti()
 
@@ -320,7 +333,30 @@ class RT_IK:
         return q
 
 class RT_SWIKA:
+    """
+    Real-Time State and Control Estimation using Optimal Control & Moving Horizon.
+
+    This class sets up a non-linear Optimal Control Problem (OCP) using CasADi
+    and Pinocchio to reconstruct full-body robot kinematics (states X, controls U)
+    from measured frame marker positions over a sliding or fixed time horizon N.
+    """
     def __init__(self, pin_model: pin.Model, keys_to_track: List, N: int, dict_dof_to_keypoints: Dict=None, with_freeflyer=True, code: str ='c'):
+        """
+        Initializes the real-time estimation problem.
+        Parameters
+        pin_model : pin.Model
+            The Pinocchio robot model containing kinematic and dynamic details.
+        keys_to_track : List[str]
+            List of frame names (markers) in the robot model to track.
+        N : int
+            The prediction/estimation horizon length (number of shooting nodes).
+        dict_dof_to_keypoints : Dict, optional
+            Mapping dictionary between robot DOFs and measured keypoints, by default None.
+        with_freeflyer : bool, optional
+            Flags if the robot has a 6-DOF floating base (e.g., humanoid/quadruped), by default True.
+        code : str, optional
+            Execution mode: 'c' for compiled shared library speed, 'python' for prototype mode, by default 'c'.
+        """
         # Initialize the Pinocchio model
         self._pin_model = pin_model
         self._nq = self._pin_model.nq
@@ -340,6 +376,16 @@ class RT_SWIKA:
         self._ocp_func = self.create_ocp()
     
     def create_ocp(self):
+        """
+        Formulates the mathematical Optimal Control Problem using CasADi's Opti framework.
+        Defines the system kinematics using Pinocchio symbolic templates, builds
+        multiple-shooting gap-closing constraints, applies joint position limits,
+        and structures a weighted multi-objective cost function:
+        Returns
+        casadi.Function
+            A non-linear CasADi mapping function encapsulating the optimization problem.
+        """
+
         ##### CASADI SYMBOLICS #####
         cmodel = cpin.Model(self._pin_model)
         cdata = cmodel.createData()
@@ -441,6 +487,14 @@ class RT_SWIKA:
         return ocp_func
         
     def compile_Ccode(self):
+        """
+        Generates and compiles C-code from the symbolic CasADi OCP function.
+        Exports the problem structure into an optimized, self-contained 'ocp.c' file
+        and invokes 'gcc' with high optimization flags (-O3) to link against 'fatrop',
+        'blasfeo', and math utilities. Generates a shared object library (.so)
+        for ultra-low latency execution loops.
+        """
+
         cname = self._ocp_func.generate('ocp.c', {"with_header": False, "main":True})
         oname_O3 = 'ocp_O3.so'
         print('Compiling with O3 optimization: ', oname_O3)
@@ -450,6 +504,24 @@ class RT_SWIKA:
         print('Compilation time = ', (t2-t1), ' s')
 
     def solve(self, X: np.ndarray, U: np.ndarray, marker_meas: np.ndarray, X0: np.ndarray, cost_weights: np.ndarray, dt: float):
+        """
+        Executes the optimization solver for a given time step.
+
+        Evaluates either the raw Python symbolic graph or calls external
+        C-compiled shared object depending on the initialization configuration.
+
+        Parameters
+        X (np.ndarray): Warm-start matrix for states over the horizon, shape (nx, N).
+        U (np.ndarray): Warm-start matrix for controls/accelerations over the horizon, shape (nu, N).
+        marker_meas (np.ndarray): Flattened actual physical marker measurements, shape (3 * Nb_markers, N).
+        X0 (np.ndarray): Reference anchor state for the regularization penalty term, shape (nx, 1).
+        cost_weights (np.ndarray): Weight coefficients vector [w_marker, w_state_reg, w_control_reg], shape (3, 1).
+        dt (float): Discretization time step size for numerical integration.
+
+        Returns
+        Tuple ([np.ndarray, np.ndarray]): X (Optimized state trajectory over the horizon) and U (Optimized control input trajectory over the horizon)
+        """
+
         if self._code == 'c': # Use codegen 
             ocp_fun = casadi.external('ocp','./ocp_O3.so')
         elif self._code == 'python': 
