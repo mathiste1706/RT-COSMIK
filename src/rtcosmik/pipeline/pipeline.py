@@ -111,7 +111,7 @@ class PipelineProcess(Process):
           3. Triangulates multi-view inputs and re-projects coordinates into world coordinates.
           4. Smooths coordinates using a multi-channel digital IIR filter.
           5. Calibration Phase (First Sample): Automatically builds, scales, and registers
-             a Pinocchio `HumanLoader` robot model to the subject, recalibrates joint marker 
+             a Pinocchio HumanLoader robot model to the subject, recalibrates joint marker 
              frame translations, and boots cold-start optimization trajectories.
           6. Tracking Phase: Resolves kinematics frame-by-frame via either:
                 - Sample-by-Sample (sbs): Fast localized quadratic programming (QuadProg).
