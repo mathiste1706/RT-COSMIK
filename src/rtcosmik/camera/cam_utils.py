@@ -198,9 +198,8 @@ def load_camera_parameters(config_path, num_cameras=2):
             R = np.eye(3)
             translation = np.zeros((3, 1))
         else:
-            # Subsequent cameras read the chaining file (e.g., c0_to_c2, c2_to_c4, c4_to_c6)
-            prev_cam_nb = (i - 1) * 2
-            extrinsic_file = os.path.join(config_path, f"c{prev_cam_nb}_to_c{cam_nb}_params_color.yaml")
+            # All subsequent cameras read their file relative to c0
+            extrinsic_file = os.path.join(config_path, f"c0_to_c{cam_nb}_params_color.yaml")
             R, translation = load_cam_to_cam_params(extrinsic_file)
             
             R = np.array(R)
