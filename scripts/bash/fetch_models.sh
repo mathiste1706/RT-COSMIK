@@ -65,20 +65,33 @@ download_release_asset "${YOLO_OWNER}" "${YOLO_REPO}" "${YOLO_TAG}" "${YOLO_ASSE
 
 # -------- Export to TensorRT engine (fixed imgsz=640, batch=2, not dynamic) --------
 DEVICE="${DEVICE:-0}"
-BATCH=4
+BATCH=2
 IMGSZ=640
-
-
-if [[ -f "${YOLO_ENGINE}" ]]; then
-  echo "[OK] TensorRT engine already exists: ${YOLO_ENGINE}"
-  exit 0
+# --- SMART ENGINE CHECK ---
+if [[ -f "${YOLO_ENGINE}" && -f "${YOLO_ENGINE}.meta" ]]; then
+  # Read the comma-separated batch and imgsz from the meta file
+  IFS=',' read -r SAVED_BATCH SAVED_IMGSZ < "${YOLO_ENGINE}.meta"
+  
+  if [[ "${SAVED_BATCH}" -eq "${BATCH}" && "${SAVED_IMGSZ}" -eq "${IMGSZ}" ]]; then
+    echo "[OK] TensorRT engine already exists with matching configuration (batch=${BATCH}, imgsz=${IMGSZ}). Skipping!"
+    exit 0
+  else
+    echo "[INFO] Config mismatch detected!"
+    echo "       -> Current requested: batch=${BATCH}, imgsz=${IMGSZ}"
+    echo "       -> Found in metadata: batch=${SAVED_BATCH}, imgsz=${SAVED_IMGSZ}"
+    echo "[INFO] Proceeding to re-export/re-batch..."
+  fi
+else
+  echo "[INFO] Engine or metadata file missing. Proceeding to export..."
 fi
-
+# ---------------------------
 if ! command -v yolo >/dev/null 2>&1; then
   echo "[ERR] 'yolo' CLI not found. Install ultralytics in this environment." >&2
   echo "      pip install ultralytics" >&2
   exit 1
 fi
+
+
 
 # Quick sanity: exporting to engine typically needs onnx + tensorrt python packages available.
 python3 - <<'PY' || true
@@ -102,6 +115,7 @@ yolo export \
   imgsz=${IMGSZ} \
   batch=${BATCH} \
   dynamic=False \
+  half=True \
   simplify=False | tee "${LOG}"
 
  
