@@ -121,12 +121,8 @@ def main(args):
 
     else: # offline mode
 
-
         # --- 1. INITIALISATION MESHCAT ---
         vis = meshcat.Visualizer()
-        vis["/Background"].set_property("top_color", [1, 1, 1])  # Dark gray (RGB values in [0, 1])
-        vis["/Background"].set_property("bottom_color", [0.65, 0.65, 0.65])  # Same color → flat background
-
         LOGGER.info(f"[INFO] Meshcat visualizer available here: {vis.url()}")
 
         vis_markers = vis["markers"]
@@ -146,22 +142,11 @@ def main(args):
             raise RuntimeError(f"No videos found in {args.data_dir}")
 
         NUM_CAMERAS = len(paths)
-        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
-        check_yolo_engine(NUM_CAMERAS)
-
-        """Uses ffprobe to read the total number of frames from the video header."""
-        cmd = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=nb_frames',
-            '-of', 'json', str(paths[0])
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        data = json.loads(result.stdout)
-        total_frames=int(data['streams'][0]['nb_frames'])
-        LOGGER.info(f"[INFO] Total frames determined from ffprobe: {total_frames}")
 
         src = OfflineVideoSource(paths=paths, size_wh=(W, H))
+        
+        check_yolo_engine(NUM_CAMERAS)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
 
         est = NLFEstimator(
             yolo_path=settings.yolo_path,
@@ -209,24 +194,9 @@ def main(args):
                 dists=dists,
                 projections=projections,
             )
-            if args.save:   # Works even if it's a string
-                p3d_file.append(p3d.tolist())
-
-                if points_saved and first_run_not_finished:
-                        
-                        if isinstance(args.save, str):
-                            target_path=args.save
-                        else:
-                            target_path="points_saved.json"
-                        
-                        with open(target_path, "w") as f:
-                            json.dump(p3d_file, f)
-                            first_run_not_finished=False
-                        print("\n\n SAVED")
 
             poses_triangul = torch.from_numpy(p3d).to(dtype=torch.float32)
             poses_cam0=nlf_out['poses3d'][0]/1000
-
             if nlf_out['poses3d'][0].shape[0] > 0:
                 points_all = poses_cam0.view(-1, 3).cpu().numpy().T
                 
@@ -239,7 +209,6 @@ def main(args):
                     g.PointCloud(position=points_all, color=colors, size=0.02)
                 )
 
-                #points_all2 = Triangulated result
                 points_all2 = poses_triangul.view(-1, 3).cpu().numpy().T
                 colors2 = np.zeros_like(points_all2)
                 colors2[0, :] = 0.0  # R
@@ -250,16 +219,9 @@ def main(args):
                     g.PointCloud(position=points_all2, color=colors2, size=0.02)
                 )
 
-                
-
             else:
                 vis_markers.delete()
                 vis_markers2.delete()
-            
-            frame_counter+=1
-            if args.save and frame_counter==total_frames-1:
-                points_saved=True
-                    
 
         src.release()
 
@@ -268,7 +230,6 @@ if __name__ == "__main__":
     p.add_argument("--online", action="store_true")
     p.add_argument("--data-dir", type=str, default="data", help="Folder containing input videos")
     p.add_argument("--videos", nargs="*", default=None, help="Optional explicit list of input videos")
-    p.add_argument("--save", nargs="?", const="point_saved.json", default=False, help="flag to save the points calculated at the specific path or by the default in the relative path under the name points_saved.json ")
     args = p.parse_args()
 
     if args.online:

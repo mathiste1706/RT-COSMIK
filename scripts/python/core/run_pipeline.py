@@ -232,7 +232,6 @@ def main(args):
     # Determine size
     W = settings.width
     H = settings.height
-    mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, 4)
     world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
     
     if args.online:
@@ -240,6 +239,7 @@ def main(args):
         NUM_CAMERAS = len(cameras)
         FRAME_SHAPE = (H, W, 3)
         check_yolo_engine(NUM_CAMERAS)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
         camera_buffers, camera_timestamps, camera_locks, frame_counters, camera_barrier, stop_event = create_camera_shared_ressources(NUM_CAMERAS, FRAME_SHAPE)
         results_queues = create_pipeline_shared_ressources()
 
@@ -314,6 +314,8 @@ def main(args):
             raise RuntimeError(f"No videos found in {args.data_dir}")
 
         NUM_CAMERAS = len(paths)
+        check_yolo_engine(NUM_CAMERAS)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
 
         """Uses ffprobe to read the total number of frames from the video header."""
         cmd = [
@@ -355,6 +357,7 @@ def main(args):
 
         frame_counter = 0
         start_time = time.perf_counter()
+        
         try:
             while True:
 
@@ -418,6 +421,8 @@ def main(args):
                                 first_run_not_finished=False
                             print("\n\n SAVED")
 
+                
+                
                 if len(p3d_buffer) == settings.N:
                     p3d_buffer_array = np.array(p3d_buffer)
 

@@ -50,12 +50,12 @@ def main(args):
     # Determine size
     W = settings.width
     H =settings.height
-    mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path)
 
     if args.online:
         cameras = list_cameras()
         NUM_CAMERAS = len(cameras)
         FRAME_SHAPE = (H, W, 3)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
         check_yolo_engine(NUM_CAMERAS)
         camera_buffers, camera_timestamps, camera_locks, frame_counters, camera_barrier, stop_event = create_camera_shared_ressources(NUM_CAMERAS, FRAME_SHAPE)
 
@@ -113,6 +113,7 @@ def main(args):
         
         NUM_CAMERAS=len(paths)
         check_yolo_engine(NUM_CAMERAS)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
         
         '''
         To save output videos to check if they are synchronized
