@@ -847,7 +847,7 @@ def get_local_segments_positions(sgts_poses: Dict)->Dict:
     if "thorax" in sgts_poses:
         thorax_global = sgts_poses["thorax"]
         local_positions["thorax"] = (np.linalg.inv(pelvis_pose) @ thorax_global @ np.array([0, 0, 0, 1]))[:3]
-    
+
     # Torso with respect to thorax
     if "torso" in sgts_poses:
         torso_global = sgts_poses["torso"]
@@ -938,14 +938,22 @@ def construct_segments_frames(mks_positions, gender='m', subject_height=1.80):
     # Check if all required markers are in the dataset for each segment
     sgts_poses = {}
     
-    def maybe_add_pose(segment_name, marker_list, compute_func):
+    def maybe_add_pose(segment_name, marker_list, compute_func, use_gender=False, use_height=False):
         if all(m in mks_positions for m in marker_list):
-            sgts_poses[segment_name] = compute_func(mks_positions, gender, subject_height)
+            # All functions get mks_positions
+            args = [mks_positions]
+            
+            if use_gender:
+                args.append(gender)
+            if use_height:
+                args.append(subject_height)
+                
+            sgts_poses[segment_name] = compute_func(*args)
 
     maybe_add_pose("head",      ['RSHO', 'LSHO', 'C7', 'Head', 'REar', 'LEar'],          get_head_pose)
 
     maybe_add_pose("torso",     ['RSHO', 'LSHO', 'RASI', 'LASI', 'RPSI', 'LPSI', 'C7'], get_torso_pose)
-    maybe_add_pose("thorax",     ['RSHO', 'LSHO', 'RASI', 'LASI', 'RPSI', 'LPSI', 'C7'], get_thorax_pose) # same as torso as it calls torso
+    maybe_add_pose("thorax",     ['RSHO', 'LSHO', 'RASI', 'LASI', 'RPSI', 'LPSI', 'C7'], get_thorax_pose, use_gender=True, use_height=True)
 
     maybe_add_pose("right_upperarm", ['LSHO','RSHO','RMELB','RELB'],      get_right_upperarm_pose)
     maybe_add_pose("right_lowerarm", ['RMELB','RELB','RMWRI','RWRI'],          get_right_lowerarm_pose)
@@ -955,13 +963,13 @@ def construct_segments_frames(mks_positions, gender='m', subject_height=1.80):
     maybe_add_pose("left_lowerarm", ['LMELB','LELB','LMWRI','LWRI'],          get_left_lowerarm_pose)
     maybe_add_pose("left_hand",     ['LMWRI','LWRI','LMID'],      get_left_hand_pose)
     
-    maybe_add_pose("pelvis",    ['RPSI','LPSI','RASI','LASI'],                  get_pelvis_pose)
+    maybe_add_pose("pelvis",    ['RPSI','LPSI','RASI','LASI'],                  get_pelvis_pose, use_gender=True)
     
-    maybe_add_pose("right_upperleg",    ['RASI','LASI','RKNE','RMKNE'],                 get_right_upperleg_pose)
+    maybe_add_pose("right_upperleg",    ['RASI','LASI','RKNE','RMKNE'],                 get_right_upperleg_pose, use_gender=True)
     maybe_add_pose("right_lowerleg",    ['RKNE','RMKNE','RMANK','RANK'],              get_right_lowerleg_pose)
     maybe_add_pose("right_foot",     ['RMANK','RANK','RTOE','R5MHD','RHEE'],      get_right_foot_pose)
-    
-    maybe_add_pose("left_upperleg",    ['LASI','RASI','LKNE','LMKNE'],                 get_left_upperleg_pose)
+   
+    maybe_add_pose("left_upperleg",    ['LASI','RASI','LKNE','LMKNE'],                 get_left_upperleg_pose, use_gender=True)
     maybe_add_pose("left_lowerleg",    ['LKNE','LMKNE','LMANK','LANK'],              get_left_lowerleg_pose)
     maybe_add_pose("left_foot",     ['LMANK','LANK','LTOE','L5MHD','LHEE'],      get_left_foot_pose)
     return sgts_poses
@@ -992,7 +1000,9 @@ def scale_human_model(model, mks_dict, gender='m', subject_height=1.80):
         The updated model with scaled joint placements.
 
     """
+    print("1")
     local_segments_positions = get_local_segments_positions(construct_segments_frames(mks_dict, gender, subject_height))
+    print("2")
 
     q = pin.neutral(model)
     data = pin.Data(model)
