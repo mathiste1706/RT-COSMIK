@@ -23,7 +23,7 @@ from rtcosmik.utils.mp_utils import create_camera_shared_ressources
 from rtcosmik.utils.videoReader import OfflineVideoSource
 
 from rtcosmik.nlf.PoseEstimationAPI import PoseEstimationAPI
-from instanthmr.visualizer import RerunVisualizer
+from InstantHMR.instanthmr.visualizer import RerunVisualizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,9 +83,6 @@ def main(args):
         "dists": dists,
         "projections": projections,
         
-        # Triangulation activation flags (Fixed: Restored missing comma separation)
-        "nlf_triangulation": args.nlf_triangulation,
-        "hmr_triangulation_mode": args.hmr_triangulation
     }
 
     # 3. Instantiate Architecture Coordinator Engine
@@ -146,10 +143,6 @@ if __name__ == "__main__":
                    help="Select active estimation architecture module target strategy.")
     p.add_argument("--hmr-model", type=str, default=f"{SRC_ROOT}/InstantHMR/models/instanthmr.onnx",
                    help="Explicit path configuration pointing to a deployed InstantHMR engine model.")
-    p.add_argument("--hmr-triangulation", type=str, default="dlt", choices=["dlt", "native"],
-                   help="Geometrical track selection mode used during InstantHMR processing.")
-    p.add_argument("--nlf-triangulation", action="store_true", default=True,
-                   help="Flag to activate algebraic point-cloud triangulation configurations inside NLF loops.")
     p.add_argument("--online", action="store_true", help="Initialize real-time hardware execution camera pipelines.")
     p.add_argument("--data-dir", type=str, default="data", help="Target path tracking data location directory.")
     p.add_argument("--videos", nargs="*", default=None, help="Explicit list definitions for batch media targets.")
