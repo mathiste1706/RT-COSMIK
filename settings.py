@@ -41,7 +41,6 @@ class Settings:
     # NLF
     cano_path: str = "/root/workspace/RT-COSMIK/weights/canonical_verts/smplx.npy"
     nlf_path: str = "/root/workspace/RT-COSMIK/weights/nlf/nlf_s_multi_0.2.2.torchscript"
-    
     nlf_indices = [             # For SMPLX model
         8421, 5727, 8371, 5677, # pelvis: RASI, LASI, RPSI, LPSI 
         5484, 5489, 5500, 6629, 3878, 7040, 4302, 7105, 4369, 7584, 4848, 7457, 4721, # upper: C7, T11, T6,  RSHO, LSHO, RELB, LELB, RMELB, LMELB, RWRI, LWRI, RMWRI, LMWRI
@@ -51,9 +50,6 @@ class Settings:
         9120,9002,616,6,9929,9448,  # face: Nose, Head, REar, LEar, REye, LEye
     ]
 
-    '''
-    nlf_indices =list(range(0,10475))              # For the complete SMPLX model
-    '''
     # Yolo detector
     yolo_path: str = "/root/workspace/RT-COSMIK/weights/yolo/yolov10n.engine"
     yolo_conf = 0.2
@@ -75,12 +71,17 @@ class Settings:
                             'Rknee_flex_ext','Rankle_flex_ext', 'Rankle_abd_add']
 
     # Ik type
-    ik_type: str ="sbs" # either "mhe" for SWIKA or "sbs" for sample by sample qp
-    
+    ik_type: str ="mhe" # either "mhe" for SWIKA or "sbs" for sample by sample qp
+
     # if ik_type = "mhe"
-    ik_code: str = "python" # either "python" or "c" 
+    mhe_backend: str = "acados" # solver backend: "fatrop" (validated reference) or "acados"
+    ik_code: str = "python" # fatrop only: either "python" or "c"
     cost_weights: list = field(default_factory=lambda: [1, 1e-3, 1e-5])
     N: int = 10 # number of time steps
+    # acados only: where generated C code/.so/.json go (default: <repo>/output/acados),
+    # and the acados install dir (default: read from the ACADOS_SOURCE_DIR env var).
+    acados_export_dir: str = None
+    acados_source_dir: str = None
 
     # MARKER SET 
     marker_names: list = field(default_factory=lambda: [
