@@ -502,7 +502,7 @@ class PoseEstimationAPI:
                 poses2d_list.append([pred.joints_2d])
             else:
                 poses2d_list.append(None)
-        nlf_payload = {"poses2d": poses2d_list}
+        instant_hmr_payload = {"poses2d": poses2d_list}
 
         # --- STRATEGY 1: NATIVE RECONSTRUCTION ---
         if self.triangulation_mode == "native":
@@ -540,7 +540,7 @@ class PoseEstimationAPI:
         
         if self.visualizer is not None:
             self.visualizer.log_frame(
-                images_bgr=frames_bgr, nlf_output=nlf_payload, bboxes=boxes,
+                images_bgr=frames_bgr, instant_hmr_output=instant_hmr_payload, bboxes=boxes,
                 frame_idx=self.frame_counter, timings=timings, p3d_skeleton=p3d_skeleton
             )
             self.frame_counter += 1

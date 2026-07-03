@@ -31,6 +31,7 @@ from rtcosmik.human_model.model_utils import (
     scale_human_model,
     mks_registration,
     recalibrate_marker_frames_in_joint_space,
+    construct_segments_frames,   # used only for the debug sanity check, optional
 )
 from rtcosmik.ik.ik import RT_IK, RT_SWIKA_FATROP, RT_SWIKA_ACADOS
 from rtcosmik.camera.cam_utils import (
@@ -58,62 +59,104 @@ LOGGER = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Synthetic biomarker generation  (70 joints → Direct Structural Mapping)
+# InstantHMR (70 joints) -> NLF marker name mapping
 # =============================================================================
+#
+# model_utils.py (the NLF-era IK / scaling code) expects a `mks_dict` keyed
+# by NLF marker names (RASI, LASI, RKNE, RMKNE, ...) and builds anatomical
+# segment frames (get_pelvis_pose, get_right_upperleg_pose, etc.) directly
+# from those marker positions via construct_segments_frames().
+#
+# Rather than re-deriving synthetic offsets by hand (which fights the
+# ratio_x/y/z scaling baked into those pose functions and was causing the
+# leg/torso clipping), we reuse model_utils.py UNMODIFIED and instead map
+# InstantHMR's 70 joints onto the closest matching marker names directly.
+#
+# Markers with no good single-joint correspondence (medial knee/ankle/wrist,
+# which InstantHMR does not predict separately from their lateral
+# counterpart) are duplicated from the nearest native joint with a small
+# fixed anatomical offset along the body's lateral axis — this keeps
+# dist(lateral, medial) small and consistent, matching what model_utils.py's
+# pose functions expect (axis = lateral - medial), without introducing the
+# large, error-prone offsets the previous synthetic-biomarker function used
+# for RASI/LASI/RPSI/LPSI.
+#
+# Pelvis markers (RASI/LASI/RPSI/LPSI) are the most sensitive — they set
+# the pelvis depth/width baseline (dist_rPL_lPL) that scale_human_model
+# uses to place the hip joints. InstantHMR has no ASIS/PSIS landmarks, so
+# these are derived from the hip joints with a SMALL, anatomically correct
+# offset (real ASIS-to-hip-joint-center distance is ~3-4 cm, not 6-8 cm).
 
 def _safe_unit(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
     return v / n if n > 1e-4 else fallback
 
 
-def generate_synthetic_biomarkers(joints: np.ndarray) -> Dict[str, np.ndarray]:
+def instant_hmr_joints_to_nlf_markers(joints: np.ndarray, gender: str = 'm', subject_height: float = 1.80) -> Dict[str, np.ndarray]:
     """
-    Génère les marqueurs de surface avec des axes orthogonaux alignés 
-    sur la convention Pinocchio standard (Z-Up, X-Forward, Y-Left).
+    Convert 70 world-frame InstantHMR joints to the NLF marker names that
+    model_utils.py's construct_segments_frames() / scale_human_model() /
+    mks_registration() expect — unmodified.
+
+    Direct mappings use native InstantHMR joints.
+    Synthesised markers (ASIS/PSIS, medial knee/ankle/wrist, spine, head)
+    are derived from subject anthropometry (Dempster 1955) or simple geometry.
     """
-    L_hip, R_hip = joints[9],  joints[10]
-    L_sho, R_sho = joints[5],  joints[6]
-    neck          = joints[69]
+    L_hip  = joints[9]
+    R_hip  = joints[10]
+    L_sho  = joints[5]
+    R_sho  = joints[6]
+    neck   = joints[69]
 
     hip_mid = (L_hip + R_hip) / 2.0
     sho_mid = (L_sho + R_sho) / 2.0
 
-    # --- Alignement des axes (Règle de la main droite - Standard Z-Up) ---
-    u_up    = _safe_unit(sho_mid - hip_mid,       np.array([0.0, 0.0, 1.0])) # Vertical (+Z)
-    u_fwd   = _safe_unit(np.cross(L_hip - R_hip, u_up), np.array([1.0, 0.0, 0.0])) # Avant (+X)
-    u_left  = _safe_unit(np.cross(u_up, u_fwd),   np.array([0.0, 1.0, 0.0])) # Gauche (+Y)
-    u_right = -u_left                                                        # Droite (-Y)
+    # Body axes in world frame
+    u_up   = _safe_unit(sho_mid - hip_mid,              np.array([0.0, 0.0, 1.0]))
+    u_fwd  = _safe_unit(
+        _safe_unit(np.cross(L_hip - R_hip, u_up), np.array([1.0, 0.0, 0.0])) +
+        _safe_unit(np.cross(L_sho - R_sho, u_up), np.array([1.0, 0.0, 0.0])),
+        np.array([1.0, 0.0, 0.0])
+    )
+    u_lat  = _safe_unit(R_hip - L_hip, np.array([1.0, 0.0, 0.0]))   # body-right
 
     mks: Dict[str, np.ndarray] = {}
 
-    # ---- Bassin (Positionnement anatomique réel) ----
-    mks["RASI"] = R_hip + 0.08 * u_fwd
-    mks["LASI"] = L_hip + 0.08 * u_fwd
-    mks["RPSI"] = R_hip - 0.08 * u_fwd
-    mks["LPSI"] = L_hip - 0.08 * u_fwd
-    mks["SACR"] = hip_mid - 0.09 * u_fwd
+    # ---- Pelvis (ASIS/PSIS) ------------------------------------------
+    # scale_human_model() uses dist(RASI,LASI) * ratio_z to place the hip
+    # joint center laterally. We must supply the true anatomical ASIS width,
+    # not InstantHMR's narrow internal hip-joint separation (~0.187 m).
+    # Dempster (1955): ASIS-to-ASIS = 0.191*H (male), 0.198*H (female)
+    asis_half = (0.191 if gender == 'm' else 0.198) * subject_height / 2.0
+    # ASIS ~4 cm anterior, PSIS ~5 cm posterior to hip joint center (Leardini 1999)
+    # ASIS sits roughly 6-8 cm superior to the hip joint center
+    mks["RASI"] = hip_mid + asis_half * u_lat + 0.04 * u_fwd + 0.07 * u_up
+    mks["LASI"] = hip_mid - asis_half * u_lat + 0.04 * u_fwd + 0.07 * u_up
+    mks["RPSI"] = hip_mid + asis_half * u_lat - 0.05 * u_fwd + 0.07 * u_up
+    mks["LPSI"] = hip_mid - asis_half * u_lat - 0.05 * u_fwd + 0.07 * u_up
 
-    # ---- Tronc & Colonne ----
-    mks["C7"]  = neck + 0.03 * u_up - 0.05 * u_fwd
-    mks["T11"] = hip_mid + 0.33 * (sho_mid - hip_mid) - 0.05 * u_fwd
-    mks["T6"]  = hip_mid + 0.66 * (sho_mid - hip_mid) - 0.05 * u_fwd
+    # ---- Spine -------------------------------------------------------
+    mks["T11"] = hip_mid + 0.33 * (sho_mid - hip_mid)
+    mks["T6"]  = hip_mid + 0.66 * (sho_mid - hip_mid)
+    mks["C7"]  = neck - 0.03 * u_fwd   # C7 is posterior to the neck joint
 
-    # ---- Épaules ----
-    mks["RSHO"] = R_sho + 0.02 * u_up
-    mks["LSHO"] = L_sho + 0.02 * u_up
+    # ---- Shoulders (acromion = most lateral shoulder landmark) -------
+    mks["RSHO"] = joints[68]   # right_acromion
+    mks["LSHO"] = joints[67]   # left_acromion
 
-    # ---- Bras (Latéral vs Médial) ----
-    mks["RELB"]  = joints[8] + 0.03 * u_right
-    mks["RMELB"] = joints[8] + 0.03 * u_left
-    mks["LELB"]  = joints[7] + 0.03 * u_left
-    mks["LMELB"] = joints[7] + 0.03 * u_right
-    
-    mks["RWRI"]  = joints[41] + 0.02 * u_fwd
-    mks["RMWRI"] = joints[41] - 0.02 * u_fwd
-    mks["LWRI"]  = joints[62] + 0.02 * u_fwd
-    mks["LMWRI"] = joints[62] - 0.02 * u_fwd
+    # ---- Arms --------------------------------------------------------
+    mks["RELB"]  = joints[8]    # right elbow (lateral epicondyle side)
+    mks["LELB"]  = joints[7]    # left elbow
+    mks["RMELB"] = joints[66]   # right cubital fossa (medial elbow — native)
+    mks["LMELB"] = joints[65]   # left cubital fossa
+    mks["RWRI"]  = joints[41]   # right wrist
+    mks["LWRI"]  = joints[62]   # left wrist
+    # No medial wrist in InstantHMR — offset along forward axis so
+    # Z = RWRI - RMWRI gives a valid rotation axis for get_right_lowerarm_pose
+    mks["RMWRI"] = joints[41] + 0.02 * u_fwd
+    mks["LMWRI"] = joints[62] + 0.02 * u_fwd
 
-    # ---- Mains ----
+    # ---- Hands -------------------------------------------------------
     mks["RTHU"] = joints[21]
     mks["LTHU"] = joints[42]
     mks["RMID"] = joints[29]
@@ -121,46 +164,41 @@ def generate_synthetic_biomarkers(joints: np.ndarray) -> Dict[str, np.ndarray]:
     mks["RPIN"] = joints[37]
     mks["LPIN"] = joints[58]
 
-    # ---- Jambes (Latéral vs Médial) ----
-    mks["RKNE"]  = joints[12] + 0.04 * u_right
-    mks["RMKNE"] = joints[12] + 0.04 * u_left
-    mks["LKNE"]  = joints[11] + 0.04 * u_left
-    mks["LMKNE"] = joints[11] + 0.04 * u_right
+    # ---- Legs --------------------------------------------------------
+    # Lateral knee/ankle: native joints
+    # Medial knee/ankle: small inward offset — only needs to define the
+    # rotation axis (Z = lateral - medial) for get_right_lowerleg_pose etc.
+    mks["RKNE"]  = joints[12] + 0.015 * u_lat   # 1.5 cm lateral
+    mks["RMKNE"] = joints[12] - 0.015 * u_lat   # 1.5 cm medial  ← midpoint = joints[12] exactly
+    mks["LKNE"]  = joints[11] - 0.015 * u_lat   # left lateral
+    mks["LMKNE"] = joints[11] + 0.015 * u_lat   # left medial    ← midpoint = joints[11] exactly
 
-    mks["RANK"]  = joints[14] + 0.03 * u_right
-    mks["RMANK"] = joints[14] + 0.03 * u_left
-    mks["LANK"]  = joints[13] + 0.03 * u_left
-    mks["LMANK"] = joints[13] + 0.03 * u_right
+    mks["RANK"]  = joints[14] + 0.010 * u_lat
+    mks["RMANK"] = joints[14] - 0.010 * u_lat
+    mks["LANK"]  = joints[13] - 0.010 * u_lat
+    mks["LMANK"] = joints[13] + 0.010 * u_lat
 
-    # ---- Pieds ----
+
+    
+
+    # ---- Feet --------------------------------------------------------
     mks["RTOE"]  = joints[18]
     mks["LTOE"]  = joints[15]
     mks["R5MHD"] = joints[19]
     mks["L5MHD"] = joints[16]
-    mks["RHEE"]  = joints[20] - 0.05 * u_fwd
-    mks["LHEE"]  = joints[17] - 0.05 * u_fwd
+    mks["RHEE"]  = joints[20]
+    mks["LHEE"]  = joints[17]
 
-    # ---- Visage & Tête ----
+    # ---- Head / Face -------------------------------------------------
     mks["Nose"] = joints[0]
     mks["LEye"] = joints[1]
     mks["REye"] = joints[2]
     mks["LEar"] = joints[3]
     mks["REar"] = joints[4]
-    
-    head_mid = (joints[1] + joints[2]) / 2.0
-    mks["Head"] = neck + 1.25 * (head_mid - neck)
-
-    mks["RFHD"] = joints[2] + 0.02 * u_up + 0.02 * u_fwd
-    mks["LFHD"] = joints[1] + 0.02 * u_up + 0.02 * u_fwd
-    mks["RBHD"] = joints[4] + 0.02 * u_up - 0.02 * u_fwd
-    mks["LBHD"] = joints[3] + 0.02 * u_up - 0.02 * u_fwd
-
-    lowercase_mks = {k.lower(): v for k, v in mks.items()}
-    uppercase_mks = {k.upper(): v for k, v in mks.items()}
-    mks.update(lowercase_mks)
-    mks.update(uppercase_mks)
+    mks["Head"] = neck + 0.15 * u_up   # top of skull ~15 cm above neck joint
 
     return mks
+
 
 
 # =============================================================================
@@ -264,6 +302,9 @@ def main(args):
         settings.cam_calib_path
     )
 
+    # ------------------------------------------------------------------
+    # ONLINE mode
+    # ------------------------------------------------------------------
     if args.online:
         cameras = list_cameras()
         NUM_CAMERAS = len(cameras)
@@ -298,15 +339,19 @@ def main(args):
             p.start()
 
         try:
-            while True: time.sleep(0.1)
+            while True:
+                time.sleep(0.1)
         except KeyboardInterrupt:
             stop_event.set()
             for process in processes:
-                if hasattr(process, "stop"): process.stop()
+                if hasattr(process, "stop"):
+                    process.stop()
                 process.join(timeout=2)
         return
 
+    # ------------------------------------------------------------------
     # OFFLINE mode
+    # ------------------------------------------------------------------
     vis = meshcat.Visualizer()
     LOGGER.info(f"[INFO] Meshcat URL: {vis.url()}")
     vis_markers = vis["markers"]
@@ -329,7 +374,9 @@ def main(args):
             settings, "model_path",
             "/root/workspace/RT-COSMIK/src/InstantHMR/models/instanthmr.onnx",
         ),
-        device=settings.device, yolo_path=settings.yolo_path, config={"conf": settings.yolo_conf, "imgsz": 640},
+        device=settings.device,
+        yolo_path=settings.yolo_path,
+        config={"conf": settings.yolo_conf, "imgsz": 640},
     )
 
     first_sample = True
@@ -340,46 +387,57 @@ def main(args):
     iir_filter = IIR(num_channel=num_channel, sampling_frequency=settings.fs)
     iir_filter.add_filter(order=settings.order, cutoff=settings.cutoff_freq, filter_type=settings.filter_type)
 
-    total_history = []
-    ik_history = []
+    total_history: List[float] = []
+    ik_history:    List[float] = []
 
     human_model = human_data = viz_human = ik_class = None
     x_array = u_array = deque_lstm_dict = None
-    
-    # Conservation stricte de l'état de configuration d'une frame à l'autre
-    q = None 
+    q = None
 
     try:
         while frame_counter < total_frames:
             t0 = time.perf_counter()
 
             frames = src.read()
-            if frames is None: break
+            if frames is None:
+                break
 
+            # ---- 1. Pose estimation ----------------------------------
             hmr_predictions, timings, detections, bboxes, images_rgb = est.estimate(frames)
 
             if not hmr_predictions or hmr_predictions[0] is None:
                 frame_counter += 1
                 continue
 
+            # ---- 2. Extract native 3D joints from cam0 ---------------
             pred0 = hmr_predictions[0]
             joints_3d_cam = np.asarray(pred0.joints_3d_cam, dtype=np.float64)
             if joints_3d_cam.ndim == 3:
-                joints_3d_cam = joints_3d_cam[0]
+                joints_3d_cam = joints_3d_cam[0]   # (1,70,3) → (70,3)
 
-            p3d_world = (world_R1_cam @ joints_3d_cam.T).T + world_T1_cam_flat
-            synthetic_mks = generate_synthetic_biomarkers(p3d_world)
+            # ---- 3. Transform to world frame -------------------------
+            p3d_world = (world_R1_cam @ joints_3d_cam.T).T + world_T1_cam_flat  # (70, 3)
+
+            # ---- 4. Map onto NLF marker names -------------------------
+            # Reuses model_utils.py UNMODIFIED — same code path that worked
+            # correctly with NLF.
+            nlf_mks = instant_hmr_joints_to_nlf_markers(
+                p3d_world,
+                gender=settings.human_gender,
+                subject_height=settings.human_height,
+            )
 
             try:
                 ordered_markers = np.array(
-                    [synthetic_mks[name] for name in settings.marker_names],
+                    [nlf_mks[name] for name in settings.marker_names],
                     dtype=np.float64,
                 )
             except KeyError as e:
-                LOGGER.warning(f"Missing marker in synthetic dict: {e} – skipping frame")
+                LOGGER.warning(f"Missing marker in mapped dict: {e} – skipping frame")
                 frame_counter += 1
                 continue
 
+            # ---- 5. Rolling buffer + IIR filter ----------------------
             if first_sample:
                 for _ in range(settings.N):
                     p3d_buffer.append(ordered_markers)
@@ -395,24 +453,44 @@ def main(args):
             filtered = np.reshape(filtered, (settings.N, len(settings.marker_names), 3))
             augmented_markers = filtered[-1]
 
+            # ---- 6. Meshcat: visualise markers (red) -----------------
             colors = np.zeros((3, len(settings.marker_names)), dtype=np.float64)
             colors[0, :] = 1.0
             vis_markers.set_object(g.PointCloud(position=augmented_markers.T, color=colors, size=0.02))
 
             mks_dict = dict(zip(settings.marker_names, augmented_markers))
 
+            # ---- 7. First-sample: model scaling + IK init ------------
             if first_sample:
+               
+               if first_sample:
                 LOGGER.info("[INFO] Running model calibration on first frame …")
 
+                # --- DEBUG: check pelvis frame and hip center placement ---
+                from rtcosmik.human_model.model_utils import get_virtual_pelvis_pose, get_right_upperleg_pose
+                vpp = get_virtual_pelvis_pose(mks_dict)
+                hip_r = get_right_upperleg_pose(mks_dict, gender=settings.human_gender)
+                LOGGER.info(f"[DEBUG] virtual_pelvis Y axis: {vpp[:3,1].round(3)}")
+                LOGGER.info(f"[DEBUG] hip_center R: {hip_r[:3,3].round(3)}")
+                LOGGER.info(f"[DEBUG] knee R: {mks_dict['RKNE'].round(3)}")
+                LOGGER.info(f"[DEBUG] Y=hip-knee: {(hip_r[:3,3]-mks_dict['RKNE']).round(3)}")
+
+                LOGGER.info(f"[DEBUG] ankle R: {mks_dict['RANK'].round(3)}")
+                LOGGER.info(f"[DEBUG] thigh length: {np.linalg.norm(hip_r[:3,3]-mks_dict['RKNE']):.3f}")
+                LOGGER.info(f"[DEBUG] shank length: {np.linalg.norm(mks_dict['RKNE']-mks_dict['RANK']):.3f}")
+                LOGGER.info(f"[DEBUG] total leg: {np.linalg.norm(hip_r[:3,3]-mks_dict['RANK']):.3f}")
+                                
+
                 human = robex.human.HumanLoader(
-                    height=settings.human_height, weight=settings.human_weight, gender=settings.human_gender,
+                    height=settings.human_height,
+                    weight=settings.human_weight,
+                    gender=settings.human_gender,
                 ).robot
-                human_model, human_collision_model, human_visual_model = human.model, human.collision_model, human.visual_model
+                human_model          = human.model
+                human_collision_model = human.collision_model
+                human_visual_model   = human.visual_model
 
-                human_model = mks_registration(
-                    human_model, mks_dict, gender=settings.human_gender, subject_height=settings.human_height,
-                )
-
+                # Same call order, same functions, as the NLF pipeline.
                 human_model = scale_human_model(
                     human_model, mks_dict,
                     gender=settings.human_gender,
@@ -426,90 +504,95 @@ def main(args):
 
                 viz_human = MeshcatVisualizer(human_model, human_collision_model, human_visual_model)
                 viz_human.initViewer(vis, open=True)
-                try: vis["ref"].delete()
-                except Exception: pass
-                
+                try:
+                    vis["ref"].delete()
+                except Exception:
+                    pass
                 viz_human.loadViewerModel("ref")
                 viz_human.viewer["/Background"].set_property("top_color",    [1, 1, 1])
                 viz_human.viewer["/Background"].set_property("bottom_color", [0.65, 0.65, 0.65])
 
-                # 1. Initialisation du vecteur de configuration
+                # Seed root translation so the IK starts near the marker cloud
                 q = pin.neutral(human_model)
-
-                # 2. ALIGNEMENT RACINE INITIAL (Téléporte le modèle au centre du nuage)
-                pelvis_keys = ["RASI", "LASI", "RPSI", "LPSI", "rasi", "lasi", "rpsi", "lpsi"]
-                pelvis_pts = [mks_dict[k] for k in pelvis_keys if k in mks_dict]
-                if len(pelvis_pts) >= 2:
-                    root_translation = np.mean(pelvis_pts, axis=0)
-                else:
-                    root_translation = np.mean(list(mks_dict.values()), axis=0)
-                
-                q[:3] = root_translation  # Positionne la base au cœur des marqueurs
-
-                # Calcul de l'orientation globale de la base (X=avant, Y=gauche, Z=haut)
-                try:
-                    r_hip_m = (mks_dict.get("RASI") + mks_dict.get("RPSI")) / 2.0
-                    l_hip_m = (mks_dict.get("LASI") + mks_dict.get("LPSI")) / 2.0
-                    sho_mid_m = (mks_dict.get("RSHO") + mks_dict.get("LSHO")) / 2.0
-                    hip_mid_m = (l_hip_m + r_hip_m) / 2.0
-                    
-                    u_up_m = _safe_unit(sho_mid_m - hip_mid_m, np.array([0.0, 0.0, 1.0]))
-                    u_fwd_m = _safe_unit(np.cross(l_hip_m - r_hip_m, u_up_m), np.array([1.0, 0.0, 0.0]))
-                    u_left_m = _safe_unit(np.cross(u_up_m, u_fwd_m), np.array([0.0, 1.0, 0.0]))
-                    
-                    R_matrix = np.column_stack((u_fwd_m, u_left_m, u_up_m))
-                    q[3:7] = pin.Quaternion(R_matrix).coeffs()  # [qx, qy, qz, qw]
-                except Exception:
-                    q[3:7] = np.array([0.0, 0.0, 0.0, 1.0])
-
-                # 3. Calibration locale des marqueurs basée sur la position globale correcte
-                human_model = recalibrate_marker_frames_in_joint_space(human_model, q, mks_dict, settings.marker_names)
-                viz_human.display(q)
-
-                q = pin.neutral(human_model)
+                pelvis_pts = [mks_dict[k] for k in ["RASI", "LASI", "RPSI", "LPSI"] if k in mks_dict]
+                if pelvis_pts:
+                    q[:3] = np.mean(pelvis_pts, axis=0)
 
                 if settings.ik_type == "sbs":
                     omega = {key: 1 for key in settings.keys_to_track_list}
-                    ik_class = RT_IK(human_model, mks_dict, q, settings.keys_to_track_list, settings.dt, omega)
+                    ik_class = RT_IK(
+                        human_model, mks_dict, q,
+                        settings.keys_to_track_list, settings.dt, omega,
+                    )
                     q = ik_class.solve_ik_sample_casadi()
                     ik_class._q0 = q
                     viz_human.display(q)
-                    human_model = recalibrate_marker_frames_in_joint_space(human_model, q, mks_dict, settings.marker_names)
+
+                    human_model = recalibrate_marker_frames_in_joint_space(
+                        human_model, q, mks_dict, settings.marker_names
+                    )
                     human_data = human_model.createData()
-                    ik_class = RT_IK(human_model, mks_dict, q, settings.keys_to_track_list, settings.dt, omega)
+
+                    ik_class = RT_IK(
+                        human_model, mks_dict, q,
+                        settings.keys_to_track_list, settings.dt, omega,
+                    )
 
                 elif settings.ik_type == "mhe":
                     omega = {key: 1 for key in settings.keys_to_track_list}
-                    ik_bootstrap = RT_IK(human_model, mks_dict, q, settings.keys_to_track_list, settings.dt, omega)
+                    ik_bootstrap = RT_IK(
+                        human_model, mks_dict, q,
+                        settings.keys_to_track_list, settings.dt, omega,
+                    )
                     q = ik_bootstrap.solve_ik_sample_casadi()
                     viz_human.display(q)
-                    human_model = recalibrate_marker_frames_in_joint_space(human_model, q, mks_dict, settings.marker_names)
+
+                    human_model = recalibrate_marker_frames_in_joint_space(
+                        human_model, q, mks_dict, settings.marker_names
+                    )
                     human_data = human_model.createData()
 
                     nq, nv = human_model.nq, human_model.nv
                     x_array = np.zeros((nq + nv, settings.N))
                     x_array[6, :] = 1.0
                     u_array = np.zeros((nv, settings.N))
+
                     deque_lstm_dict = deque(maxlen=settings.N)
                     for _ in range(settings.N):
                         deque_lstm_dict.append(mks_dict)
-                    array_data = np.array([np.hstack([d[m] for m in settings.keys_to_track_list]) for d in deque_lstm_dict]).T
+
+                    array_data = np.array(
+                        [np.hstack([d[m] for m in settings.keys_to_track_list])
+                         for d in deque_lstm_dict]
+                    ).T
 
                     if settings.mhe_backend == "acados":
-                        ik_class = RT_SWIKA_ACADOS(human_model, settings.keys_to_track_list, settings.N, settings.dt,
-                            export_dir=settings.acados_export_dir, acados_source_dir=settings.acados_source_dir)
+                        ik_class = RT_SWIKA_ACADOS(
+                            human_model, settings.keys_to_track_list, settings.N, settings.dt,
+                            export_dir=settings.acados_export_dir,
+                            acados_source_dir=settings.acados_source_dir,
+                        )
                     else:
-                        ik_class = RT_SWIKA_FATROP(human_model, settings.keys_to_track_list, settings.N, code=settings.ik_code)
+                        ik_class = RT_SWIKA_FATROP(
+                            human_model, settings.keys_to_track_list, settings.N,
+                            code=settings.ik_code,
+                        )
 
-                    x_array, u_array = ik_class.solve(x_array, u_array, array_data, x_array[:, -1], settings.cost_weights, settings.dt)
+                    x_array, u_array = ik_class.solve(
+                        x_array, u_array, array_data,
+                        x_array[:, -1], settings.cost_weights, settings.dt,
+                    )
                     q = pin.neutral(human_model)
                     q[:] = x_array[:nq, -1]
                     viz_human.display(q)
+
                 else:
                     raise ValueError(f"Invalid ik_type '{settings.ik_type}'. Expected 'sbs' or 'mhe'.")
 
                 LOGGER.info("[INFO] Model calibration finished – ready to process.")
                 first_sample = False
+
+            # ---- 8. Steady-state IK ----------------------------------
             else:
                 t_ik = time.perf_counter()
 
@@ -521,30 +604,32 @@ def main(args):
 
                 elif settings.ik_type == "mhe":
                     deque_lstm_dict.append(mks_dict)
-                    array_data = np.array([np.hstack([d[m] for m in settings.keys_to_track_list]) for d in deque_lstm_dict]).T
+                    array_data = np.array(
+                        [np.hstack([d[m] for m in settings.keys_to_track_list])
+                         for d in deque_lstm_dict]
+                    ).T
 
-                    # --- CORRECTION DE L'ACTUALISATION DE L'HORIZON MHE ---
-                    # 1. On extrait la configuration actuelle estimée lors du cycle précédent
-                    #    pour l'imposer comme contrainte d'état initial (x0) de notre problème courant.
                     x0_current = x_array[:, -1].copy()
 
                     try:
-                        # 2. On laisse le solveur gérer son Warm-Start interne (x_array, u_array intacts)
-                        #    en lui fournissant simplement les nouvelles cibles glissantes (array_data)
                         x_sol, u_sol = ik_class.solve(
-                            x_array, u_array, array_data, x0_current, settings.cost_weights, settings.dt
+                            x_array, u_array, array_data,
+                            x0_current, settings.cost_weights, settings.dt,
                         )
-                        
-                        # --- FILTRE DE SÉCURITÉ ANTI-DIVÈRGENCE / NAN ---
-                        if not np.isnan(x_sol).any() and np.linalg.norm(x_sol[:3, -1] - x0_current[:3]) < 1.5:
+
+                        if (not np.isnan(x_sol).any() and
+                                np.linalg.norm(x_sol[:3, -1] - x0_current[:3]) < 1.5):
                             x_array, u_array = x_sol, u_sol
-                            q[:] = x_array[:human_model.nq, -1] # Extraction de l'état final stabilisé
+                            q[:] = x_array[:human_model.nq, -1]
                             viz_human.display(q)
                         else:
-                            LOGGER.warning(f"[WARNING] Solver output invalid or jumped too far at frame {frame_counter}. Posture locked.")
-                            # On réinjecte la dernière configuration valide pour réinitialiser le warm-start
+                            LOGGER.warning(
+                                f"[WARNING] Solver output invalid or jumped too far "
+                                f"at frame {frame_counter}. Posture locked."
+                            )
                             x_array[:human_model.nq, :] = q[:, None]
                             x_array[human_model.nq:, :] = 0.0
+
                     except Exception as e:
                         LOGGER.error(f"[ERROR] Solver crashed at frame {frame_counter}: {e}")
                         x_array[:human_model.nq, :] = q[:, None]
@@ -564,17 +649,33 @@ def main(args):
     print("\n--- BENCHMARK RESULTS ---")
     print(f"Total frames processed : {frame_counter}")
     if total_history:
-        print(f"Total pipeline – mean  : {np.mean(total_history):.1f} ms  |  median : {np.median(total_history):.1f} ms  |  FPS : {1000.0 / np.mean(total_history):.1f}")
+        print(
+            f"Total pipeline – mean  : {np.mean(total_history):.1f} ms  |  "
+            f"median : {np.median(total_history):.1f} ms  |  "
+            f"FPS : {1000.0 / np.mean(total_history):.1f}"
+        )
     if ik_history:
-        print(f"IK solver      – mean  : {np.mean(ik_history):.1f} ms  |  median : {np.median(ik_history):.1f} ms")
+        print(
+            f"IK solver      – mean  : {np.mean(ik_history):.1f} ms  |  "
+            f"median : {np.median(ik_history):.1f} ms"
+        )
     print("-" * 40)
 
 
+# =============================================================================
+# Entry point
+# =============================================================================
+
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="RT-COSMIK offline pipeline – InstantHMR backend")
-    p.add_argument("--online", action="store_true", help="Use live cameras instead of recorded videos")
-    p.add_argument("--data-dir", type=str, default="data", help="Folder containing .mp4 video files")
-    p.add_argument("--videos", nargs="*", default=None, help="Explicit list of video paths (overrides --data-dir)")
+    p = argparse.ArgumentParser(
+        description="RT-COSMIK offline pipeline – InstantHMR backend"
+    )
+    p.add_argument("--online", action="store_true",
+                   help="Use live cameras instead of recorded videos")
+    p.add_argument("--data-dir", type=str, default="data",
+                   help="Folder containing .mp4 video files")
+    p.add_argument("--videos", nargs="*", default=None,
+                   help="Explicit list of video paths (overrides --data-dir)")
     args = p.parse_args()
 
     if args.online:

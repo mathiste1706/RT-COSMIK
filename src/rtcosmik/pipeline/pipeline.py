@@ -12,7 +12,7 @@ from rtcosmik.nlf.nlf import NLFEstimator
 from rtcosmik.triangulation.triangulation import triangulate_points
 from rtcosmik.filtering.iir import IIR
 from rtcosmik.human_model.model_utils import scale_human_model, mks_registration, recalibrate_marker_frames_in_joint_space
-from rtcosmik.ik.ik import RT_IK, RT_SWIKA
+from rtcosmik.ik.ik import RT_IK, RT_SWIKA_FATROP, RT_SWIKA_ACADOS
 from rtcosmik.camera.cam_utils import load_camera_parameters,load_world_transformation
 
 import logging
@@ -20,16 +20,6 @@ import logging
 LOGGER = logging.getLogger(__name__)
 
 class PipelineProcess(Process):
-
-    """
-    Main real-time asynchronous estimation pipeline running as a dedicated system Process.
-    
-    This process acts as the core engine of the system. It synchronizes multi-camera 
-    shared memory inputs, infers 2D keypoints via a batched NLF Estimator, triangulates 
-    them into 3D world space, applies an IIR multi-channel filter 
-    to remove noise, do marker registration, and Inverse Kinematics (IK).
-    """
-
     def __init__(self, 
                  settings,
                  frame_counters,
@@ -47,30 +37,6 @@ class PipelineProcess(Process):
                  num_cameras: int = 2,
                  logger=None,
                  ):
-        
-        """
-        Initializes the pipeline process with multi-process communication queues and calibration objects.
-
-        Parameters:
-            settings (Object): Global configuration settings container parsing parameters
-            frame_counters (List[int]): tracks individual camera lane frame counts.
-            camera_buffers (List[Array]): Raw shared memory buffers containing raw sequential image payloads.
-            camera_locks (List[Lock]): Process-safe mutual exclusion locks protecting shared frame buffers from race conditions.
-            timestamp_buffers (List[Array]): Shared character byte streams documenting hardware trigger timestamps.
-            results_queues (List[Queue]): Inter-process communication output conduits 
-                - Index 0: Emits filtered 3D world marker position dictionaries.
-                - Index 1: Emits the calculated generalized joint configuration vector 'q'
-            stop_event (Event): Inter-process event flag triggering complete termination of the process execution.
-            mtxs (List[np.ndarray]): List of 3x3 array matrices containing individual camera coefficients.
-            dists (List[np.ndarray]): Lens distortion coefficients utilized to correct the images.
-            projections (List[np.ndarray]): 3x4 projection matrices mapping points to the main camera.
-            world_R1_cam (np.ndarray): 3x3 rotation matrix mapping primary camera spatial layout into global coordinates.
-            world_T1_cam (np.ndarray): 3x1 translation offset mapping primary camera position into global coordinates.
-            frame_shape (tuple, optional): Expected dimensions of camera arrays as (Height, Width, Channels). Defaults to (720, 1280, 3).
-            num_cameras (int, optional): Total active multi-cam input lanes to parse. Defaults to 2.
-            logger (logging.Logger, optional): Custom logging handler. If None, defaults to the system global instance. Defaults to None.
-        """
-
         super().__init__()
         # MP
         self.camera_buffers = camera_buffers
@@ -101,23 +67,6 @@ class PipelineProcess(Process):
         self.logger = logger or LOGGER
 
     def run(self):
-
-        """
-        The main infinite runtime processing loop for the execution block.
-
-        Performs the following synchronous pipeline stages per frame step:
-          1. Polls and locks atomic shared memory blocks for fresh multi-camera image sets.
-          2. Runs batched deep 2D human keypoint bounding regressions via the NLF estimator.
-          3. Triangulates multi-view inputs and re-projects coordinates into world coordinates.
-          4. Smooths coordinates using a multi-channel digital IIR filter.
-          5. Calibration Phase (First Sample): Automatically builds, scales, and registers
-             a Pinocchio HumanLoader robot model to the subject, recalibrates joint marker 
-             frame translations, and boots cold-start optimization trajectories.
-          6. Tracking Phase: Resolves kinematics frame-by-frame via either:
-                - Sample-by-Sample (sbs): Fast localized quadratic programming (QuadProg).
-                - Moving Horizon Estimation (mhe): Comprehensive temporal non-linear window estimation (SWIKA).
-          7. Pushes outputs directly into analytical consumer queues for system viewing.
-        """
 
         est = NLFEstimator(
             yolo_path=self.settings.yolo_path,
@@ -239,7 +188,7 @@ class PipelineProcess(Process):
                                 self.logger.info("[INFO] Model calibration finished, ready to process...")
 
                             elif self.settings.ik_type == 'mhe':
-                                ik_class = RT_SWIKA(human_model, self.settings.keys_to_track_list, self.settings.N, code = self.settings.ik_code)
+                                ik_class = RT_SWIKA_FATROP(human_model, self.settings.keys_to_track_list, self.settings.N, code = self.settings.ik_code)
 
                                 x_array = np.zeros((human_model.nq+human_model.nv, self.settings.N))
                                 x_array[6,:]=1
@@ -259,7 +208,10 @@ class PipelineProcess(Process):
                                 # Recalibrate briefly the markers translation in joint frames
                                 human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,self.settings.marker_names)
 
-                                ik_class = RT_SWIKA(human_model, self.settings.keys_to_track_list, self.settings.N, code = self.settings.ik_code)
+                                if self.settings.mhe_backend == 'acados':
+                                    ik_class = RT_SWIKA_ACADOS(human_model, self.settings.keys_to_track_list, self.settings.N, self.settings.dt, export_dir=self.settings.acados_export_dir, acados_source_dir=self.settings.acados_source_dir, build=False)
+                                else:
+                                    ik_class = RT_SWIKA_FATROP(human_model, self.settings.keys_to_track_list, self.settings.N, code = self.settings.ik_code)
                                 self.logger.info("[INFO] Model calibration finished, ready to process...")
                             else : 
                                 raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")
