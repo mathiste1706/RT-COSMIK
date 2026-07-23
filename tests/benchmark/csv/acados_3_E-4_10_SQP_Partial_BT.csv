@@ -1,0 +1,69 @@
+# Total Video Frames: 277
+# Frames fully processed: 275
+# Read: mean 0.0 ms | median 0.0 ms | max 4.1 ms
+# NLF: mean 19.3 ms | median 18.3 ms | max 240.1 ms
+# IK: mean 21.1 ms | median 15.2 ms | max 78.9 ms
+# Triangulate+Filter: mean 1.0 ms | median 1.0 ms | max 2.9 ms
+# Marker viz (meshcat set_object): mean 0.5 ms | median 0.5 ms | max 2.2 ms
+# Solve (ik_class.solve/quadprog): mean 16.1 ms | median 9.9 ms | max 74.9 ms
+# Display viz (meshcat viz_human.display): mean 3.2 ms | median 2.9 ms | max 10.2 ms
+# Post-calibration span (includes first-call compile spike): 6.09 s
+# Steady-state time (init, compilation and first frame excluded): 6.05 s
+# Steady-state throughput: 45.48 FPS
+# IK Type: mhe
+# Solver: acados
+# nlp_solver_type: SQP
+# qp_solver: PARTIAL_CONDENSING_HPIPM
+# hessian_approx: GAUSS_NEWTON
+# integrator_type: DISCRETE
+# qp_solver_warm_start: 0
+# nlp_solver_max_iter: 10
+# qp_solver_iter_max: 3
+# tol: 0.0001
+# globalization: MERIT_BACKTRACKING
+# N: 3
+# body_joint_rmse_deg: 11.8652
+joint,rmse
+FF_X,1.5016042822241937
+FF_Y,2.1209084532326385
+FF_Z,2.1079268529698423
+FF_quatx,0.49669980480925136
+FF_quaty,1.135404449608063
+FF_quatz,0.4979283843060253
+FF_quatw,0.25623178466819185
+Lhip_flex_ext,0.12747627888600058
+Lhip_abd_add,0.08497574940719566
+Lhip_int_ext_rot,0.1787808343847148
+Lknee_flex_ext,0.16444744286036228
+Lankle_flex_ext,0.21035310645952915
+Lankle_abd_add,0.21702380647567465
+Lumbar_flex_ext,0.261941538443668
+Lumbar_lateral_flex,0.10646290309443478
+Thoracic_flex_ext,0.3016155903059887
+Thoracic_lateral_flex,0.09816046092475338
+Thoracic_rot_int_ext,0.10452282202308273
+Lcalvicule_x,0.049076944786717966
+Lshoulder_flex_ext,0.09394853724250862
+Lshoulder_abd_add,0.08580192058704611
+Lshoulder_int_ext_rot,0.2037484191701616
+Lelbow_flex_ext,0.117363925120115
+Lelbow_pron_supi,0.5081358604561009
+Lwrist_flex_ext,0.12201582046828592
+Lwrist_x,0.21842538457555816
+Cervical_flex_ext,0.21377442969129193
+Cervical_lat_bend,0.04882775514190684
+Cervical_int_ext_rot,0.017122778344636585
+rcalvicule_x,0.03988921620637951
+Rshoulder_flex_ext,0.17819283933287064
+Rshoulder_abd_add,0.10220648854924498
+Rshoulder_int_ext_rot,0.3039402966474451
+Relbow_flex_ext,0.11639042986572246
+Relbow_pron_supi,0.4639438964616083
+Rwrist_flex_ext,0.10081054675589514
+Rwrist_x,0.240827940088593
+Rhip_flex_ext,0.1987309910156076
+Rhip_abd_add,0.08042081892182022
+Rhip_int_ext_rot,0.11141877068960453
+Rknee_flex_ext,0.2233383009966188
+Rankle_flex_ext,0.21629099758781933
+Rankle_abd_add,0.3838296168890954
