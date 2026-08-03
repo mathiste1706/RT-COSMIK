@@ -103,7 +103,7 @@ def plot_per_joint_summary(df_joints: pd.DataFrame, labels: list):
 
 
 def plot_all_joints_grid(df_joints: pd.DataFrame, labels: list):
-    """Plots a 6x6 grid figure with dynamic Y-scaling and flush solid bars."""
+    """Plots a grid with narrow subplot frames, flush bars, and tight legend spacing."""
     joints = df_joints['joint'].values
     n_joints = len(joints)
     n_runs = len(labels)
@@ -111,7 +111,7 @@ def plot_all_joints_grid(df_joints: pd.DataFrame, labels: list):
     cols = 6
     rows = int(np.ceil(n_joints / cols))
 
-    fig, axes = plt.subplots(rows, cols, figsize=(24, 22))
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 16))
     axes = axes.flatten()
     cmap = plt.get_cmap('tab10')
 
@@ -122,28 +122,25 @@ def plot_all_joints_grid(df_joints: pd.DataFrame, labels: list):
         ax = axes[idx]
         vals = df_joints.loc[df_joints['joint'] == joint_name, labels].values.flatten().astype(float)
 
-        # Draw solid bars flush against each other (width=1.0)
-        for i, (x_pos, val) in enumerate(zip(x_indices, vals)):
-            ax.bar(
-                x_pos,
-                val,
-                color=run_colors[i],
-                width=1.0,  # Width = 1.0 makes bars flush
-                edgecolor='black',
-                linewidth=0.5
-            )
+        bars = ax.bar(
+            x_indices,
+            vals,
+            color=run_colors,
+            width=1.0,
+            edgecolor='black',
+            linewidth=0.5
+        )
 
-        ax.set_title(joint_name, fontsize=10, fontweight='bold')
+        ax.set_title(joint_name, fontsize=9, fontweight='bold')
         ax.set_xticks([])
         ax.grid(True, linestyle=':', alpha=0.6, axis='y')
-        ax.set_ylabel('Deg', fontsize=8)
+        ax.set_ylabel('Deg', fontsize=7)
 
         # --- Adaptive Y-Axis Limits ---
         val_min = np.nanmin(vals) if len(vals) > 0 else 0.0
         val_max = np.nanmax(vals) if len(vals) > 0 else 1.0
         rng = val_max - val_min
 
-        # Zoom in if variation is small relative to total height
         if rng < 0.3 * val_max and val_min > 0.5:
             y_min = max(0.0, val_min - max(0.3, rng * 1.5))
             y_max = val_max + max(0.6, rng * 2.5)
@@ -152,10 +149,9 @@ def plot_all_joints_grid(df_joints: pd.DataFrame, labels: list):
             y_max = val_max * 1.45 if val_max > 0 else 1.0
 
         ax.set_ylim(y_min, y_max)
-        ax.set_xlim(-0.6, n_runs - 0.4)  # Flush bounds
+        ax.set_xlim(-0.5, n_runs - 0.5)
 
-        # Annotate values vertically above bars
-        for bar in ax.patches:
+        for bar in bars:
             height = bar.get_height()
             if height >= 0:
                 ax.annotate(
@@ -166,33 +162,32 @@ def plot_all_joints_grid(df_joints: pd.DataFrame, labels: list):
                     ha='center',
                     va='bottom',
                     rotation=90,
-                    fontsize=6,
+                    fontsize=15,
                     fontweight='bold'
                 )
 
     for idx in range(n_joints, len(axes)):
         fig.delaxes(axes[idx])
 
-    # Solid legend handles without hatching
     legend_handles = [
         plt.Rectangle((0, 0), 1, 1, facecolor=run_colors[i], edgecolor='black')
         for i in range(n_runs)
     ]
 
-    plt.suptitle('Individual Joint RMSE Breakdown Across Solver Runs (Degrees)', fontsize=16, fontweight='bold', y=0.995)
+    plt.suptitle('Individual Joint RMSE Breakdown Across Solver Runs (Degrees)', fontsize=14, fontweight='bold', y=0.995)
     
-    # Reserve 10% space at bottom for legend to prevent cutoff
-    plt.tight_layout(rect=[0, 0.10, 1, 0.98])
+    # Tight bottom spacing (8%) to remove excess whitespace
+    plt.tight_layout(rect=[0, 0.05, 1, 0.98])
 
     fig.legend(
         legend_handles,
         labels,
         loc='lower center',
-        ncol=min(3, n_runs),
+        ncol=min(2, n_runs),
         fontsize=10,
         frameon=True,
         facecolor='white',
-        bbox_to_anchor=(0.5, 0.015)
+        bbox_to_anchor=(0.5, 0.005)
     )
 
     plt.savefig('all_joints_grid.png', dpi=300, bbox_inches='tight')
@@ -203,7 +198,7 @@ def plot_all_joints_grid(df_joints: pd.DataFrame, labels: list):
 
 
 def save_individual_joint_plots(df_joints: pd.DataFrame, labels: list, output_dir: str = "individual_plots"):
-    """Saves a separate PNG for every joint with zoom scaling and flush bars."""
+    """Saves a separate PNG for every joint with narrow frames and flush bars."""
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -211,21 +206,21 @@ def save_individual_joint_plots(df_joints: pd.DataFrame, labels: list, output_di
     n_runs = len(labels)
     cmap = plt.get_cmap('tab10')
 
+    x_indices = np.arange(n_runs)
+    run_colors = [cmap(i % 10) for i in range(n_runs)]
+
     for joint_name in joints:
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=(4.5, 5))
         vals = df_joints.loc[df_joints['joint'] == joint_name, labels].values.flatten().astype(float)
 
-        x = np.arange(n_runs)
-        
-        for i, (x_pos, val) in enumerate(zip(x, vals)):
-            ax.bar(
-                x_pos,
-                val,
-                color=cmap(i % 10),
-                width=1.0,  # Width = 1.0 makes bars flush
-                edgecolor='black',
-                linewidth=0.6
-            )
+        bars = ax.bar(
+            x_indices,
+            vals,
+            color=run_colors,
+            width=1.0,
+            edgecolor='black',
+            linewidth=0.6
+        )
 
         val_min = np.nanmin(vals) if len(vals) > 0 else 0.0
         val_max = np.nanmax(vals) if len(vals) > 0 else 1.0
@@ -238,7 +233,7 @@ def save_individual_joint_plots(df_joints: pd.DataFrame, labels: list, output_di
             y_min = 0.0
             y_max = val_max * 1.35 if val_max > 0 else 1.0
 
-        for bar in ax.patches:
+        for bar in bars:
             height = bar.get_height()
             ax.annotate(
                 f'{height:.2f}°',
@@ -254,13 +249,14 @@ def save_individual_joint_plots(df_joints: pd.DataFrame, labels: list, output_di
 
         ax.set_xticks([])
         ax.set_ylim(y_min, y_max)
-        ax.set_xlim(-0.6, n_runs - 0.4)
+        ax.set_xlim(-0.5, n_runs - 0.5)
+
         ax.set_ylabel('RMSE (Degrees)', fontsize=11, fontweight='bold')
-        ax.set_title(f'Joint: {joint_name} — RMSE Comparison', fontsize=13, fontweight='bold')
+        ax.set_title(f'Joint: {joint_name}', fontsize=12, fontweight='bold')
         ax.grid(True, linestyle='--', alpha=0.5, axis='y')
 
         handles = [
-            plt.Rectangle((0, 0), 1, 1, facecolor=cmap(i % 10), edgecolor='black')
+            plt.Rectangle((0, 0), 1, 1, facecolor=run_colors[i], edgecolor='black')
             for i in range(n_runs)
         ]
         ax.legend(handles, labels, loc='upper left', bbox_to_anchor=(1, 1))
@@ -280,7 +276,7 @@ if __name__ == '__main__':
         else 'default'
     )
 
-     # csv_files = [
+    # csv_files = [
     #     "csv/ipopt_10.csv",
     #     "csv/ipoqt_3.csv",
     #     "csv/acados_3_E-4_5_SQP_Full_NO-BT.csv",
@@ -305,10 +301,8 @@ if __name__ == '__main__':
     # ]
 
     csv_files = [
-        "csv/ipoqt_3.csv",
-        "csv/acados_3_E-4_5_RTI_Full_NO-BT.csv",
-        "csv/acados_3_E-3_5_SQP_Full_NO-BT.csv",
-        "csv/acados_3_E-3_5_RTI_Full_NO-BT.csv"
+        "csv/overhead_M/acados_2_E-2_5_RTI_Full_NO-BT.csv",
+        "csv/overhead_M/acados_2_E-2_5_RTI_Full_NO-BT_4_cam.csv",
     ]
 
     df_joints, labels = load_all_data(csv_files)
