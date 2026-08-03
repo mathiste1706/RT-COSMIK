@@ -59,6 +59,7 @@ class NLFEstimator:
         self.Kt = torch.from_numpy(K_stack).to(self.device, dtype=self.geom_dtype)  # (C,3,3)
 
         self.C = self.Kt.shape[0]
+        print("C: ", self.C)
         # Per-camera lock state to keep tracking the same person across frames.
         self._locked_boxes_xyxy = [None for _ in range(self.C)]
         self._lock_missing_count = [0 for _ in range(self.C)]

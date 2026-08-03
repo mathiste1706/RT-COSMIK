@@ -664,14 +664,15 @@ class RT_SWIKA_ACADOS:
         # NOTE: ocp.constraints.x0 is intentionally NOT set -> the arrival cost
         # stays soft (w1 ||x_0 - X0||^2), matching RT_SWIKA_FATROP (no hard clamp).
 
-        ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
+        ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
         ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
         ocp.solver_options.integrator_type = "DISCRETE"
-        ocp.solver_options.nlp_solver_type = "SQP"
+        ocp.solver_options.nlp_solver_type = "SQP_RTI"
+        ocp.solver_options.qp_solver_warm_start = 0  # Reuses previous QP solution
         ocp.solver_options.nlp_solver_max_iter = self._max_iter if self._max_iter is not None else 50
-        ocp.solver_options.qp_solver_iter_max = 10
-        ocp.solver_options.tol = 1e-4
-        ocp.solver_options.globalization = "MERIT_BACKTRACKING"
+        ocp.solver_options.qp_solver_iter_max = 3
+        ocp.solver_options.tol = 1e-2
+        ocp.solver_options.globalization = "FIXED_STEP"
 
         ocp.code_export_directory = self._export_dir
         return AcadosOcpSolver(ocp, json_file=self._json_path,

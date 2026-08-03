@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from rtcosmik.nlf.nlf import NLFEstimator, DisplayConsumerNLF
 from rtcosmik.config_loader import settings
-from rtcosmik.camera.cam_utils import list_cameras, load_camera_parameters, load_world_transformation, load_four_camera_parameters
+from rtcosmik.camera.cam_utils import list_cameras, load_camera_parameters, load_world_transformation
 from rtcosmik.camera.camera import Camera
 from rtcosmik.utils.mp_utils import create_camera_shared_ressources
 from rtcosmik.triangulation.triangulation import triangulate_points
@@ -83,13 +83,13 @@ def main(args):
     # Determine size
     W = settings.width
     H = settings.height
-    mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path)
-    world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
 
     if args.online:
         cameras = list_cameras()
         NUM_CAMERAS = len(cameras)
         FRAME_SHAPE = (H, W, 3)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
+        world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
         camera_buffers, camera_timestamps, camera_locks, frame_counters, camera_barrier, stop_event = create_camera_shared_ressources(NUM_CAMERAS, FRAME_SHAPE)
 
         # Create camera processes
@@ -143,6 +143,18 @@ def main(args):
 
     else: # offline mode
 
+        if args.videos and len(args.videos) > 0:
+            paths = [Path(v) for v in args.videos]
+        else:
+            paths = list_videos(Path(args.data_dir))
+        if len(paths) == 0:
+            raise RuntimeError(f"No videos found in {args.data_dir}")
+
+        NUM_CAMERAS = len(paths)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
+        world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
+
+
         # --- 1. INITIALISATION MESHCAT ---
         vis = meshcat.Visualizer()
         LOGGER.info(f"[INFO] Meshcat visualizer available here: {vis.url()}")
@@ -155,15 +167,6 @@ def main(args):
         world_M_cam[:3, 3] = world_T1_cam
         vis_markers.set_transform(world_M_cam)
         vis_markers2.set_transform(world_M_cam)
-
-        if args.videos and len(args.videos) > 0:
-            paths = [Path(v) for v in args.videos]
-        else:
-            paths = list_videos(Path(args.data_dir))
-        if len(paths) == 0:
-            raise RuntimeError(f"No videos found in {args.data_dir}")
-
-        NUM_CAMERAS = len(paths)
 
         src = OfflineVideoSource(paths=paths, size_wh=(W, H))
 
@@ -238,10 +241,11 @@ def main(args):
                 vis_markers2.set_object(
                     g.PointCloud(position=points_all2, color=colors2, size=0.02)
                 )
-
             else:
                 vis_markers.delete()
                 vis_markers2.delete()
+            
+
 
         src.release()
 
