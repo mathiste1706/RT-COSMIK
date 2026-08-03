@@ -1,10 +1,150 @@
-import meshcat
-import meshcat.geometry as g
-import meshcat.transformations as tf
-from pinocchio.visualize import MeshcatVisualizer
-    
+"""
+viewer.py -- ViewerProcess for the online (multi-camera, multiprocessing)
+pipeline, using viser instead of meshcat.
+
+Includes ManualViserRobotVisualizer, a Pinocchio -> viser geometry loader
+that works around a ViserVisualizer.loadViewerModel() bug where multiple
+geometries (e.g. mesh-backed body segments sharing/near the same joint) were
+being dropped or mis-attached, instead of one node per geometry.
+
+ManualViserRobotVisualizer mirrors the small subset of MeshcatVisualizer's
+API this pipeline actually uses (initViewer / loadViewerModel / display), so
+it's a close to drop-in replacement for pinocchio's ViserVisualizer.
+
+Requires: pip install trimesh
+"""
+import numpy as np
+import pinocchio as pin
+
+try:
+    import trimesh
+except ImportError as exc:
+    raise ImportError(
+        "ManualViserRobotVisualizer needs trimesh: "
+        "pip install trimesh --break-system-packages"
+    ) from exc
+
+
+def _geom_to_trimesh(geom_obj) -> "trimesh.Trimesh":
+    """Convert one pinocchio GeometryObject's hppfcl shape into a trimesh.Trimesh.
+
+    NOTE: hppfcl class names below (Capsule/Sphere/Cylinder/Box) match recent
+    pinocchio/hppfcl releases, but shape-class naming has shifted across
+    versions in the past -- if you hit an "Unsupported geometry type" error,
+    print type(geom_obj.geometry).__name__ and add a branch for it here.
+    """
+    geom = geom_obj.geometry
+    gtype = type(geom).__name__
+
+    if gtype == "Capsule":
+        mesh = trimesh.creation.capsule(
+            radius=geom.radius, height=2.0 * geom.halfLength, count=(8, 8)
+        )
+    elif gtype == "Sphere":
+        mesh = trimesh.creation.icosphere(radius=geom.radius, subdivisions=2)
+    elif gtype == "Cylinder":
+        mesh = trimesh.creation.cylinder(
+            radius=geom.radius, height=2.0 * geom.halfLength, sections=16
+        )
+    elif gtype == "Box":
+        mesh = trimesh.creation.box(extents=2.0 * np.array(geom.halfSide))
+    else:
+        # Mesh-backed geometry (BVHModel/Convex/etc.) -- load from the
+        # original mesh file instead of trying to reconstruct the shape.
+        if getattr(geom_obj, "meshPath", None):
+            mesh = trimesh.load(geom_obj.meshPath, force="mesh")
+        else:
+            raise ValueError(
+                f"Unsupported geometry type '{gtype}' for '{geom_obj.name}' "
+                f"and no meshPath to fall back on."
+            )
+
+    color = getattr(geom_obj, "meshColor", None)
+    if color is not None and len(color) >= 3:
+        rgba = np.array(
+            [color[0], color[1], color[2], color[3] if len(color) > 3 else 1.0]
+        )
+        mesh.visual.vertex_colors = np.tile((rgba * 255).astype(np.uint8), (len(mesh.vertices), 1))
+
+    # Critical: GeometryObject.meshScale is what scale_human_model uses to
+    # fit generic template meshes to this subject's anthropometry. Skipping
+    # this renders every segment at its raw template size -- MeshcatVisualizer
+    # applies it internally, which is why meshcat looked right and this
+    # manual loader (before this fix) rendered an oversized, overlapping blob.
+    scale = np.asarray(getattr(geom_obj, "meshScale", [1.0, 1.0, 1.0]), dtype=float).flatten()
+    if not np.allclose(scale, 1.0):
+        S = np.eye(4)
+        S[0, 0], S[1, 1], S[2, 2] = scale
+        mesh.apply_transform(S)
+
+    return mesh
+
+
+class ManualViserRobotVisualizer:
+    """Drop-in-ish replacement for pinocchio's ViserVisualizer for this
+    pipeline's usage pattern: initViewer(viewer=server) -> loadViewerModel()
+    -> display(q) every frame."""
+
+    def __init__(self, model: pin.Model, collision_model: pin.GeometryModel,
+                 visual_model: pin.GeometryModel):
+        self.model = model
+        # Match ViserVisualizer's constructor signature; we only actually
+        # render the visual model (collision capsules stay hidden, same as
+        # MeshcatVisualizer's default).
+        self.collision_model = collision_model
+        self.visual_model = visual_model
+        self.data = model.createData()
+        self.visual_data = visual_model.createData()
+        self.server = None
+        self.root = "ref"
+        self._handles = []  # index-aligned with visual_model.geometryObjects
+
+    def initViewer(self, viewer):
+        self.server = viewer
+
+    def loadViewerModel(self, rootNodeName="ref"):
+        self.root = rootNodeName
+        self._handles = []
+        for i, geom_obj in enumerate(self.visual_model.geometryObjects):
+            try:
+                mesh = _geom_to_trimesh(geom_obj)
+            except Exception as exc:
+                print(f"[WARN] ManualViserRobotVisualizer: skipping "
+                      f"'{geom_obj.name}' ({exc})")
+                self._handles.append(None)
+                continue
+            # Index-prefixed path guarantees uniqueness even if multiple
+            # geometries share a name or parent joint 
+            path = f"/{self.root}/{i:03d}_{geom_obj.name}"
+            handle = self.server.scene.add_mesh_trimesh(path, mesh)
+            self._handles.append(handle)
+
+    def display(self, q):
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateGeometryPlacements(self.model, self.data, self.visual_model, self.visual_data)
+        for i, handle in enumerate(self._handles):
+            if handle is None:
+                continue
+            oMg = self.visual_data.oMg[i]
+            quat = pin.Quaternion(oMg.rotation)
+            handle.wxyz = np.array([quat.w, quat.x, quat.y, quat.z], dtype=np.float64)
+            handle.position = np.asarray(oMg.translation, dtype=np.float64)
+
+    # No-ops kept for API parity with ViserVisualizer/MeshcatVisualizer call
+    # sites in run_pipeline.py / pipeline.py -- collisions are never loaded
+    # here so there's nothing to toggle.
+    def displayCollisions(self, flag: bool):
+        pass
+
+    def displayVisuals(self, flag: bool):
+        pass
+import viser
+# ManualViserRobotVisualizer (defined above) replaces pinocchio.visualize's
+# ViserVisualizer, which drops/mis-attaches multi-geometry bodies.
+ViserVisualizer = ManualViserRobotVisualizer
+
 from multiprocessing import Process, Queue, Event
-import pinocchio as pin 
+import pinocchio as pin
 import example_robot_data as robex
 from rtcosmik.saver.csv_saver import CSVSaver
 from rtcosmik.human_model.model_utils import scale_human_model
@@ -20,45 +160,64 @@ LOGGER = logging.getLogger(__name__)
 class Viewer:
     def __init__(self, model, collision_model, visual_model, marker_names, freeflyer=True):
         self.model = model
-        self.collision_model = collision_model 
+        self.collision_model = collision_model
         self.visual_model = visual_model
 
         self.marker_names = marker_names
         self.freeflyer = freeflyer
-        
-        self.vis = meshcat.Visualizer()
-        LOGGER.info(f"[INFO] Meshcat visualizer available here: {self.vis.url()}")
-        self.vis_markers = self.vis["markers"]
 
-        self.marker_colors = np.zeros((3,len(self.marker_names)))
-        self.marker_colors[0, :] = 1.0  # R
-        self.marker_colors[1, :] = 0.0  # G
-        self.marker_colors[2, :] = 0.0  # B
+        # viser starts its own web server; the URL is printed automatically,
+        # but we also grab host/port to log it the same way the meshcat
+        # version did.
+        self.server = viser.ViserServer()
+        LOGGER.info(f"[INFO] Viser visualizer available here: http://{self.server.get_host()}:{self.server.get_port()}")
 
-        # Init meshcat viewer for human
-        # Visualizers
-        self.viz_human = MeshcatVisualizer(self.model, self.collision_model, self.visual_model)
-        self.viz_human.initViewer(self.vis, open=True)
-        
-        # Don't delete the whole Meshcat tree: keep '/markers' etc.
+        # Ground grid, matching the floor grid MeshcatVisualizer/pinocchio
+        # shows by default. Assumes z-up with the model standing on z=0
+        # (consistent with the joint placements we've been seeing: feet at
+        # the most negative z, head at the most positive z).
+        self.server.scene.add_grid(
+            "/grid",
+            width=10.0,
+            height=10.0,
+            position=(0.0, 0.0, 0.0),
+        )
+
+        self.marker_colors = np.zeros((len(self.marker_names), 3), dtype=np.uint8)
+        self.marker_colors[:, 0] = 255  # R
+        self.marker_colors[:, 1] = 0    # G
+        self.marker_colors[:, 2] = 0    # B
+
+        self._markers_handle = None
+
+        # Init viser visualizer for human
+        self.viz_human = ViserVisualizer(self.model, self.collision_model, self.visual_model)
+        self.viz_human.initViewer(viewer=self.server)
+        self.viz_human.loadViewerModel(rootNodeName="ref")
+
+        # Background styling: viser doesn't expose a meshcat-style
+        # top/bottom gradient background property. A flat scene background
+        # color is the closest equivalent; comment out if unsupported in
+        # your viser version.
         try:
-            self.vis["ref"].delete()
+            self.server.scene.set_background_image(None)  # clear any default env image
         except Exception:
             pass
-        self.viz_human.loadViewerModel("ref")
 
-        self.viz_human.viewer["/Background"].set_property("top_color", [1, 1, 1])  # Dark gray (RGB values in [0, 1])
-        self.viz_human.viewer["/Background"].set_property("bottom_color", [0.65, 0.65, 0.65])  # Same color → flat background
-
-    
     def display_q(self, q):
         self.viz_human.display(q)
 
     def display_markers(self, pos_markers_dict):
         pts = np.stack(list(pos_markers_dict.values()), axis=0).astype(np.float32)
-        self.vis_markers.set_object(
-                    g.PointCloud(position=pts.T, color=self.marker_colors, size=0.02)
-                )
+        # Re-adding a point cloud under the same name replaces it in place,
+        # same effect as meshcat's set_object on a stable path.
+        self._markers_handle = self.server.scene.add_point_cloud(
+            name="/markers",
+            points=pts,
+            colors=self.marker_colors,
+            point_size=0.02,
+        )
+
 
 class ViewerProcess(Process):
     def __init__(self,

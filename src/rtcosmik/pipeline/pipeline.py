@@ -8,6 +8,9 @@ from multiprocessing import Process, Array, Lock, Value, Event, Queue
 from typing import List
 import time
 
+import viser
+from rtcosmik.viewer.viewer import ManualViserRobotVisualizer as ViserVisualizer
+
 from rtcosmik.nlf.nlf import NLFEstimator
 from rtcosmik.triangulation.triangulation import triangulate_points
 from rtcosmik.filtering.iir import IIR
@@ -36,6 +39,7 @@ class PipelineProcess(Process):
                  frame_shape: tuple = (720, 1280, 3),
                  num_cameras: int = 2,
                  logger=None,
+                 enable_viz: bool = True,
                  ):
         super().__init__()
         # MP
@@ -63,10 +67,30 @@ class PipelineProcess(Process):
         self.projections=projections
         self.world_R1_cam=world_R1_cam
         self.world_T1_cam=world_T1_cam
+
+        # viser visualization: this process gets its OWN server (separate
+        # from ViewerProcess's, if that process is also running). Set
+        # enable_viz=False if you only want ViewerProcess to draw and don't
+        # want a second browser tab/server spun up from here.
+        self.enable_viz = enable_viz
+        self.marker_path = "/markers"
         
         self.logger = logger or LOGGER
 
     def run(self):
+
+        server = None
+        viz_human = None
+        markers_handle = None  # persistent viser point-cloud handle, created once below
+        if self.enable_viz:
+            server = viser.ViserServer()
+            self.logger.info(f"[INFO] Viser visualizer available here: http://{server.get_host()}:{server.get_port()}")
+            server.scene.add_grid(
+                "/grid",
+                width=10.0,
+                height=10.0,
+                position=(0.0, 0.0, 0.0),
+            )
 
         est = NLFEstimator(
             yolo_path=self.settings.yolo_path,
@@ -160,15 +184,44 @@ class PipelineProcess(Process):
 
                         augmented_markers=filtered_p3d_buffer[-1]
 
+                        if self.enable_viz and server is not None:
+                            colors = np.zeros((augmented_markers.shape[0], 3), dtype=np.uint8)
+                            colors[:, 0] = 255  # R
+                            if markers_handle is None:
+                                # First frame only: creates the scene node.
+                                markers_handle = server.scene.add_point_cloud(
+                                    self.marker_path,
+                                    points=augmented_markers.astype(np.float32),
+                                    colors=colors,
+                                    point_size=0.02,
+                                )
+                            else:
+                                # Subsequent frames: mutate buffers in place
+                                # instead of recreating the node.
+                                markers_handle.points = augmented_markers.astype(np.float32)
+                                markers_handle.colors = colors
+
                         if self.first_sample:
                             mks_dict = dict(zip(self.settings.marker_names, augmented_markers))
 
                             human = robex.human.HumanLoader(height=self.settings.human_height, weight=self.settings.human_weight, gender=self.settings.human_gender).robot
                             human_model = human.model
+                            human_collision_model = human.collision_model
+                            human_visual_model = human.visual_model
 
                             #scale the model to data
                             human_model = scale_human_model(human_model, mks_dict, gender=self.settings.human_gender, subject_height=self.settings.human_height)
                             human_model= mks_registration(human_model, mks_dict, gender=self.settings.human_gender, subject_height=self.settings.human_height)
+
+                            if self.enable_viz and server is not None:.
+                                viz_human = ViserVisualizer(human_model, human_collision_model, human_visual_model)
+                                viz_human.initViewer(viewer=server)
+                                viz_human.loadViewerModel(rootNodeName="ref")
+                                # See note in run_pipeline.py: without this,
+                                # ViserVisualizer shows the collision capsules
+                                # instead of the visual mesh.
+                                viz_human.displayCollisions(False)
+                                viz_human.displayVisuals(True)
 
                             # IK
                             if self.settings.ik_type == 'sbs':
@@ -180,6 +233,9 @@ class PipelineProcess(Process):
 
                                 q = ik_class.solve_ik_sample_casadi()
                                 ik_class._q0 = q
+
+                                if viz_human is not None:
+                                    viz_human.display(q)
 
                                 # Recalibrate briefly the markers translation in joint frames
                                 human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,self.settings.marker_names)
@@ -203,7 +259,9 @@ class PipelineProcess(Process):
 
                                 q = pin.neutral(human_model)
                                 q[:] = np.array(x_array[:human_model.nq,-1]).flatten()
-                                viz_human.display(q)
+
+                                if viz_human is not None:
+                                    viz_human.display(q)
 
                                 # Recalibrate briefly the markers translation in joint frames
                                 human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,self.settings.marker_names)
@@ -227,9 +285,11 @@ class PipelineProcess(Process):
                                 ik_class._dict_m = mks_dict
                                 q = ik_class.solve_ik_sample_quadprog() 
                                 ik_class._q0 = q
+                                if viz_human is not None:
+                                    viz_human.display(q)
                                 self.results_queues[1].put((new_counters, q))
 
-                            elif settings.ik_type == 'mhe':
+                            elif self.settings.ik_type == 'mhe':
                                 deque_lstm_dict.append(mks_dict)
                                 array_data = np.array([np.hstack([d[marker] for marker in self.settings.keys_to_track_list]) for d in deque_lstm_dict]).T
                                 
@@ -237,6 +297,8 @@ class PipelineProcess(Process):
 
                                 q = pin.neutral(human_model)
                                 q[:] = np.array(x_array[:human_model.nq,-1]).flatten()
+                                if viz_human is not None:
+                                    viz_human.display(q)
                                 self.results_queues[1].put((new_counters, q))
                             else : 
                                 raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")

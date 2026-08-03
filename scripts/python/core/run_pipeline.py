@@ -12,15 +12,14 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-import meshcat
-import meshcat.geometry as g
-import meshcat.transformations as tf
+import viser
 
-import cv2
+from rtcosmik.utils.videoReader import OfflineVideoSource, list_videos
 import numpy as np
 import torch
-import pinocchio as pin 
-from pinocchio.visualize import MeshcatVisualizer
+import pinocchio as pin
+
+from rtcosmik.viewer.viewer import ManualViserRobotVisualizer as ViserVisualizer
 
 from rtcosmik.config_loader import settings
 from rtcosmik.nlf.nlf import NLFEstimator, DisplayConsumerNLF
@@ -40,28 +39,142 @@ import example_robot_data as robex
 
 import logging
 
+import os
 import ctypes
 import subprocess
 import json
 
 import threading
 import queue
-import os
 
-try:
-    # Hard-override the process affinity mask back to all 32 cores
-    os.sched_setaffinity(0, set(range(32)))
-except Exception as e:
-    print(f"[PRE-START WARNING] Could not force 32-core affinity: {e}", file=sys.stderr)
+import csv
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    force=True
-)
+JOINT_ANGLES_NAMES = [
+    'FF_X', 'FF_Y', 'FF_Z', 'FF_quatx', 'FF_quaty', 'FF_quatz', 'FF_quatw',
+    'Lhip_flex_ext', 'Lhip_abd_add', 'Lhip_int_ext_rot', 'Lknee_flex_ext', 'Lankle_flex_ext', 'Lankle_abd_add',
+    'Lumbar_flex_ext', 'Lumbar_lateral_flex',
+    'Thoracic_flex_ext', 'Thoracic_lateral_flex', 'Thoracic_rot_int_ext',
+    'Lcalvicule_x',
+    'Lshoulder_flex_ext', 'Lshoulder_abd_add', 'Lshoulder_int_ext_rot', 'Lelbow_flex_ext', 'Lelbow_pron_supi', 'Lwrist_flex_ext', 'Lwrist_x',
+    'Cervical_flex_ext', 'Cervical_lat_bend', 'Cervical_int_ext_rot',
+    'rcalvicule_x',
+    'Rshoulder_flex_ext', 'Rshoulder_abd_add', 'Rshoulder_int_ext_rot', 'Relbow_flex_ext', 'Relbow_pron_supi', 'Rwrist_flex_ext', 'Rwrist_x',
+    'Rhip_flex_ext', 'Rhip_abd_add', 'Rhip_int_ext_rot',
+    'Rknee_flex_ext', 'Rankle_flex_ext', 'Rankle_abd_add'
+]
+
+import logging
+from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
+
+
+def save_joint_angles_csv(saved_data, save_dir, settings, ocp=None, benchmark_stats=None):
+    """Saves joint angles to joint_angles_pre.csv with benchmark stats and OCP solver options in the header."""
+    if not saved_data:
+        LOGGER.warning("[WARN] No joint angle data recorded to save.")
+        return
+
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    csv_file = save_path / "joint_angles_pre.csv"
+
+    # Match joint names to vector length
+    sample_q = saved_data[0][1]
+    joint_names = getattr(settings, "joint_angles_names", None)
+    if not joint_names or len(joint_names) != len(sample_q):
+        if "JOINT_ANGLES_NAMES" in globals() and len(sample_q) == len(JOINT_ANGLES_NAMES):
+            joint_names = JOINT_ANGLES_NAMES
+        else:
+            joint_names = [f"q_{i}" for i in range(len(sample_q))]
+
+    headers = ["frame"] + list(joint_names)
+
+    # Debug log to verify what object is actually being passed in
+    if ocp is None:
+        LOGGER.warning("[WARN] `ocp` argument passed to `save_joint_angles_csv` is None! Check your function call.")
+    else:
+        LOGGER.info(f"[DEBUG] `ocp` object passed: {type(ocp).__name__}")
+
+    # Recursive dynamic lookup across ocp, settings, and internal sub-objects
+    def find_param(key, default="N/A", max_depth=3):
+        roots = [r for r in [ocp, settings] if r is not None]
+        visited = set()
+
+        def _search(obj, depth):
+            if depth > max_depth or obj is None or id(obj) in visited:
+                return None
+            visited.add(id(obj))
+
+            # 1. Direct attribute check
+            if hasattr(obj, key):
+                val = getattr(obj, key, None)
+                if val is not None and not callable(val):
+                    return val
+
+            # 2. Dictionary check
+            if isinstance(obj, dict) and key in obj and obj[key] is not None:
+                return obj[key]
+
+            # 3. Recurse into child attributes / properties (including private ones)
+            attrs = []
+            if hasattr(obj, "__dict__"):
+                attrs.extend(obj.__dict__.keys())
+            else:
+                attrs.extend([a for a in dir(obj) if not a.startswith("__")])
+
+            for attr in attrs:
+                if attr.startswith("__") or attr in ("saved_data", "data", "parent"):
+                    continue
+                try:
+                    child = getattr(obj, attr, None)
+                    if child is not None and not callable(child) and not isinstance(child, (str, int, float, list, tuple)):
+                        res = _search(child, depth + 1)
+                        if res is not None:
+                            return res
+                except Exception:
+                    pass
+            return None
+
+        for root in roots:
+            res = _search(root, 0)
+            if res is not None:
+                return res
+        return default
+
+    with open(csv_file, mode="w", newline="", encoding="utf-8") as f:
+        # --- Benchmark Timing Stats Metadata ---
+        if benchmark_stats:
+            for key, val in benchmark_stats.items():
+                f.write(f"# {key}: {val}\n")
+
+        # --- Solver & OCP Options Metadata ---
+        ik_type = getattr(settings, "ik_type", "mhe")
+        mhe_backend = getattr(settings, "mhe_backend", "acados")
+        f.write(f"# IK Type: {ik_type}\n")
+        f.write(f"# Solver: {mhe_backend}\n")
+        f.write(f"# nlp_solver_type: {find_param('nlp_solver_type')}\n")
+        f.write(f"# qp_solver: {find_param('qp_solver')}\n")
+        f.write(f"# hessian_approx: {find_param('hessian_approx')}\n")
+        f.write(f"# integrator_type: {find_param('integrator_type')}\n")
+        f.write(f"# qp_solver_warm_start: {find_param('qp_solver_warm_start')}\n")
+        f.write(f"# nlp_solver_max_iter: {find_param('nlp_solver_max_iter', find_param('mhe_max_iter'))}\n")
+        f.write(f"# qp_solver_iter_max: {find_param('qp_solver_iter_max')}\n")
+        f.write(f"# tol: {find_param('tol')}\n")
+        f.write(f"# globalization: {find_param('globalization')}\n")
+        f.write(f"# N: {settings.N}\n")
+
+        # --- CSV Header & Data Rows ---
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for frame_idx, q_vec, _ in saved_data:
+            writer.writerow([frame_idx] + [float(val) for val in q_vec])
+
+    LOGGER.info(
+        f"[INFO] Successfully saved {len(saved_data)} frames with benchmarks and parameters to {csv_file.resolve()}"
+    )
+LOGGER = logging.getLogger(__name__)
 
 
 def _get_allowed_cpus():
@@ -75,6 +188,30 @@ def _get_allowed_cpus():
         return list(range(os.cpu_count() or 1))
 
 
+def _drop_hyperthread_siblings(cpu_ids):
+    """Keep only ONE logical CPU per physical core, dropping the rest.
+
+    This makes the pipeline behave as if hyperthreading were off, WITHOUT
+    touching the host's actual SMT state (no /sys writes, no root needed,
+    no effect on other processes/containers sharing the machine). It's
+    container-scoped and fully reversible just by not calling this.
+
+    Real host-level SMT off (if you have it and want the host-wide effect
+    instead) is a separate, one-line terminal action:
+        echo off > /sys/devices/system/cpu/smt/control   # requires --privileged
+        echo on  > /sys/devices/system/cpu/smt/control   # to re-enable
+    """
+    seen_cores = set()
+    kept = []
+    for cpu in cpu_ids:
+        core = _get_physical_core_id(cpu)
+        if core in seen_cores:
+            continue
+        seen_cores.add(core)
+        kept.append(cpu)
+    return kept
+
+
 def _get_physical_core_id(cpu_id):
     """Physical core ID for a logical CPU, to detect hyperthread siblings."""
     try:
@@ -85,41 +222,33 @@ def _get_physical_core_id(cpu_id):
         return cpu_id  # fallback: treat as its own isolated core
 
 
-def _get_cpu_max_freq_khz(cpu_id):
-    """Max frequency this logical CPU can reach — used to distinguish
-    P-cores (high) from E-cores (lower) on hybrid Intel chips, since
-    /topology/core_id alone doesn't tell you which is which."""
-    try:
-        path = f"/sys/devices/system/cpu/cpu{cpu_id}/cpufreq/cpuinfo_max_freq"
-        with open(path) as f:
-            return int(f.read().strip())
-    except Exception:
-        return 0  # unknown -> treated as lowest priority
-
-
 def _compute_core_pins(allowed_cpus):
+    """Split the CPUs this process is actually allowed to use across the
+    three pipeline stages, preferring to give ik_worker a physical core that
+    reader/gpu_worker don't share (via hyperthreading) when there's enough
+    room. Falls back to an even split of raw CPU IDs if physical-core
+    detection fails or too few distinct cores are available to isolate.
+    """
     by_core = {}
     for cpu in allowed_cpus:
         core = _get_physical_core_id(cpu)
         by_core.setdefault(core, []).append(cpu)
-
-    # Rank physical cores by max frequency, fastest first -- puts P-cores
-    # ahead of E-cores on hybrid chips, so ik_worker (the heaviest, most
-    # latency-sensitive single-thread workload) gets a fast core.
-    def core_max_freq(cpu_list):
-        return max(_get_cpu_max_freq_khz(c) for c in cpu_list)
-
-    physical_cores = sorted(by_core.values(), key=core_max_freq, reverse=True)
+    physical_cores = list(by_core.values())  # list of CPU-id lists, grouped by physical core
 
     if len(physical_cores) >= 3:
-        ik_cpus = physical_cores[0]                                   # fastest core, exclusive
-        reader_cpus = physical_cores[-1]                               # slowest core is fine for I/O-bound reader
-        gpu_cpus = [c for core in physical_cores[1:-1] for c in core]  # everything else
+        # Enough distinct physical cores to give each stage its own.
+        reader_cpus = physical_cores[0]
+        gpu_cpus = [c for core in physical_cores[1:-1] for c in core]
+        ik_cpus = physical_cores[-1]
     elif len(physical_cores) == 2:
-        ik_cpus = physical_cores[0]        # fastest core, exclusive
-        reader_cpus = physical_cores[1]
-        gpu_cpus = physical_cores[1]
+        # Two physical cores only: isolate ik_worker on one entirely,
+        # let reader+gpu_worker share the other.
+        reader_cpus = physical_cores[0]
+        gpu_cpus = physical_cores[0]
+        ik_cpus = physical_cores[1]
     else:
+        # One physical core (or topology detection failed): can't isolate
+        # anything meaningfully -- just split the raw CPU list evenly.
         n = len(allowed_cpus)
         third = max(1, n // 3)
         reader_cpus = allowed_cpus[:third] or allowed_cpus[:1]
@@ -156,56 +285,20 @@ def _pin_current_thread_to_cores(core_ids):
         LOGGER.warning(f"[WARN] Could not set CPU affinity to {core_ids}: {exc}")
 
 # -----------------------
-# Meshcat debug helpers
+# Viser debug helpers
 # -----------------------
 
 
-def make_triad_geom(axis_length=0.08, linewidth=2):
-    """
-    RGB triad as LineSegments:
-      X = red, Y = green, Z = blue
-    Compatible with meshcat versions that don't have g.Axes.
-    """
-    if hasattr(g, "Axes"):
-        return g.Axes(axis_length=axis_length)
+def _pin_se3_to_viser_pose(M: pin.SE3):
+    """Convert a pinocchio SE3 to (wxyz, xyz) as viser scene handles expect."""
+    quat = pin.Quaternion(M.rotation)
+    wxyz = np.array([quat.w, quat.x, quat.y, quat.z], dtype=np.float64)
+    xyz = np.asarray(M.translation, dtype=np.float64)
+    return wxyz, xyz
 
-    pts = np.array([
-        [0.0, axis_length,  0.0, 0.0,       0.0, 0.0],
-        [0.0, 0.0,          0.0, axis_length,0.0, 0.0],
-        [0.0, 0.0,          0.0, 0.0,       0.0, axis_length],
-    ], dtype=np.float32)
-
-    cols = np.array([
-        [255, 255,   0,   0,   0,   0],  # R
-        [  0,   0, 255, 255,   0,   0],  # G
-        [  0,   0,   0,   0, 255, 255],  # B
-    ], dtype=np.uint8)
-
-    geom = g.PointsGeometry(position=pts, color=cols)
-    mat  = g.LineBasicMaterial(vertexColors=True, linewidth=linewidth)
-    return g.LineSegments(geom, mat)
-
-
-def make_empty_pointcloud():
-    P = np.zeros((3, 0), dtype=np.float32)
-    C = np.zeros((3, 0), dtype=np.uint8)
-
-    if hasattr(g, "PointCloud"):
-        return g.PointCloud(P, C)
-
-    geom = g.PointsGeometry(position=P, color=C)
-    mat = g.PointsMaterial(size=0.005, vertexColors=True)
-    return g.Points(geom, mat)
-
-
-def _pin_se3_to_meshcat_tf(M: pin.SE3) -> np.ndarray:
-    T = np.eye(4)
-    T[:3, :3] = M.rotation
-    T[:3, 3] = M.translation
-    return T
 
 def setup_debug_visuals(
-    vis,
+    server: "viser.ViserServer",
     model: pin.Model,
     marker_names,
     triad_length=0.08,
@@ -213,27 +306,37 @@ def setup_debug_visuals(
     root="debug",
     clear_root=True,
 ):
+    """Sets up per-joint and per-marker-frame coordinate triads plus a live
+    point cloud showing the model's own marker frame positions.
+
+    Unlike meshcat (path-addressable, no handle needed), viser scene nodes
+    are mutated through the handle object returned at creation time, so we
+    keep those handles around in `dbg` instead of just paths.
+    """
     if clear_root:
-        try:
-            vis[root].delete()
-        except Exception:
-            pass
+        # viser has no per-subtree "delete everything under this path"; the
+        # handles below get replaced in-place on every setup call instead.
+        pass
 
     dbg = {
         "root": root,
-        "joint_entries": [],
-        "marker_entries": [],
-        "model_marker_path": f"{root}/model_markers",
+        "joint_handles": {},     # jid -> frame handle
+        "marker_handles": {},    # fid -> frame handle
+        "model_marker_path": f"/{root}/model_markers",
+        "model_marker_handle": None,
         "missing_marker_frames": [],
     }
 
-    triad = make_triad_geom(axis_length=triad_length, linewidth=max(1, int(triad_radius * 500)))
-
     for jid in range(1, model.njoints):
         jname = model.names[jid]
-        path = f"{root}/joints/{jid:04d}_{jname}"
-        vis[path].set_object(triad)
-        dbg["joint_entries"].append((jid, path))
+        path = f"/{root}/joints/{jid:04d}_{jname}"
+        handle = server.scene.add_frame(
+            path,
+            axes_length=triad_length,
+            axes_radius=max(triad_length * 0.03, 0.001),
+            show_axes=True,
+        )
+        dbg["joint_handles"][jid] = handle
 
     for mk in marker_names:
         try:
@@ -245,11 +348,21 @@ def setup_debug_visuals(
             dbg["missing_marker_frames"].append(mk)
             continue
 
-        path = f"{root}/marker_frames/{fid:04d}_{mk}"
-        vis[path].set_object(triad)
-        dbg["marker_entries"].append((fid, path))
+        path = f"/{root}/marker_frames/{fid:04d}_{mk}"
+        handle = server.scene.add_frame(
+            path,
+            axes_length=triad_length,
+            axes_radius=max(triad_length * 0.03, 0.001),
+            show_axes=True,
+        )
+        dbg["marker_handles"][fid] = handle
 
-    vis[dbg["model_marker_path"]].set_object(make_empty_pointcloud())
+    dbg["model_marker_handle"] = server.scene.add_point_cloud(
+        dbg["model_marker_path"],
+        points=np.zeros((0, 3), dtype=np.float32),
+        colors=np.zeros((0, 3), dtype=np.uint8),
+        point_size=0.01,
+    )
 
     if dbg["missing_marker_frames"]:
         print("[DEBUG] marker frames missing in model (not registered / not added):")
@@ -258,86 +371,70 @@ def setup_debug_visuals(
     return dbg
 
 
-def update_debug_visuals(vis, model: pin.Model, data: pin.Data, q, dbg):
+def update_debug_visuals(server: "viser.ViserServer", model: pin.Model, data: pin.Data, q, dbg):
     pin.forwardKinematics(model, data, q)
     pin.updateFramePlacements(model, data)
 
-    for jid, path in dbg.get("joint_entries", []):
-        vis[path].set_transform(_pin_se3_to_meshcat_tf(data.oMi[jid]))
+    for jid, handle in dbg.get("joint_handles", {}).items():
+        wxyz, xyz = _pin_se3_to_viser_pose(data.oMi[jid])
+        handle.wxyz = wxyz
+        handle.position = xyz
 
     marker_points = []
-    for fid, path in dbg.get("marker_entries", []):
+    for fid, handle in dbg.get("marker_handles", {}).items():
         oMf = data.oMf[fid]
-        vis[path].set_transform(_pin_se3_to_meshcat_tf(oMf))
+        wxyz, xyz = _pin_se3_to_viser_pose(oMf)
+        handle.wxyz = wxyz
+        handle.position = xyz
         marker_points.append(oMf.translation)
 
-    if marker_points:
-        P = np.stack(marker_points, axis=1)
-        C = np.tile(np.array([[0], [255], [0]], dtype=np.uint8), (1, P.shape[1]))
-        vis[dbg.get("model_marker_path", "debug/model_markers")].set_object(g.PointCloud(P, C))
+    if marker_points and dbg.get("model_marker_handle") is not None:
+        P = np.stack(marker_points, axis=0).astype(np.float32)
+        C = np.tile(np.array([0, 255, 0], dtype=np.uint8), (P.shape[0], 1))
+        # Re-adding under the same path replaces the point cloud in place.
+        dbg["model_marker_handle"] = server.scene.add_point_cloud(
+            dbg["model_marker_path"], points=P, colors=C, point_size=0.01,
+        )
 
 # -----------------------
 # Named measured markers (debug)
 # -----------------------
 
-def setup_measured_markers(vis: "meshcat.Visualizer", marker_names: Sequence[str], radius: float = 0.010, color: int = 0xff0000):
-    sphere = g.Sphere(radius)
-    mat = g.MeshPhongMaterial(color=color, opacity=0.9)
+def setup_measured_markers(server: "viser.ViserServer", marker_names: Sequence[str], radius: float = 0.010, color: int = 0xff0000):
+    """Creates one small sphere per named marker and returns a dict of
+    name -> handle so positions can be updated cheaply every frame."""
+    handles = {}
     for name in marker_names:
-        vis[f"markers/measured/{name}"].set_object(sphere, mat)
+        handles[name] = server.scene.add_icosphere(
+            f"/markers/measured/{name}",
+            radius=radius,
+            color=color,
+            position=(0.0, 0.0, 0.0),
+        )
+    return handles
 
 
-def update_measured_markers(vis: "meshcat.Visualizer", mks_dict: dict):
+def update_measured_markers(marker_handles: dict, mks_dict: dict):
     for name, p in mks_dict.items():
+        handle = marker_handles.get(name)
+        if handle is None:
+            continue
         try:
-            T = tf.translation_matrix(np.asarray(p, dtype=float).reshape(3))
+            handle.position = np.asarray(p, dtype=float).reshape(3)
         except Exception:
             continue
-        vis[f"markers/measured/{name}"].set_transform(T)
-
-def list_videos(data_dir: Path) -> List[Path]:
-    if not data_dir.exists():
-        raise FileNotFoundError(f"data dir does not exist: {data_dir}")
-    vids = [p for p in sorted(data_dir.iterdir()) if p.suffix.lower() in [".mp4"]]
-    return vids
-
-@dataclass
-class OfflineVideoSource:
-    paths: List[Path]
-    size_wh: Tuple[int, int]
-
-    def __post_init__(self):
-        self.caps = [cv2.VideoCapture(str(p)) for p in self.paths]
-        for p, cap in zip(self.paths, self.caps):
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open video: {p}")
-
-    def read(self) -> Optional[List[np.ndarray]]:
-        frames: List[np.ndarray] = []
-        for cap in self.caps:
-            ok, frame = cap.read()
-            if not ok:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok, frame = cap.read()
-                if not ok:
-                    return None
-            W, H = self.size_wh
-            if frame.shape[1] != W or frame.shape[0] != H:
-                frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_LINEAR)
-            frames.append(frame)
-        return frames
-
-    def release(self):
-        for cap in self.caps:
-            cap.release()
 
 
-def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
+def run_pipelined(src, est, server, marker_path, mtxs, dists, projections,
                    world_R1_cam, world_T1_cam, settings, total_frames, stop_event,
                    core_pins=None):
     """core_pins: optional dict like {'reader': [0], 'gpu_worker': [1,2,3],
     'ik_worker': [4,5]} to pin each worker thread to specific CPU cores.
-    Pass None (default) to skip pinning entirely."""
+    Pass None (default) to skip pinning entirely.
+
+    `server` is the shared viser.ViserServer instance; `marker_path` is the
+    scene path the live measured-marker point cloud is published under
+    (e.g. "/markers")."""
     core_pins = core_pins or {}
 
     frame_q = queue.Queue(maxsize=3)
@@ -346,7 +443,7 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
 
     read_times, nlf_times, ik_times = [], [], []
     tri_filt_times = []           # triangulation + IIR filter time per frame
-    marker_viz_times = []         # vis_markers.set_object time per frame
+    marker_viz_times = []         # marker point-cloud publish time per frame
     solve_times = []              # ik_class.solve(...) time per frame (steady-state only)
     display_viz_times = []        # viz_human.display(q) time per frame (steady-state only)
     frame_latencies = []          # end-to-end: read-start -> ik-done, per frame
@@ -361,6 +458,9 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
     span_lock = threading.Lock()
 
     ik_class_out = [None]         # holds the constructed ik_class after calibration, for post-run diagnostics
+    
+    # In-memory storage for offline joint angle & marker logging (avoids disk blocking in ik_worker)
+    saved_data = []
 
     def reader():
         if core_pins.get('reader'):
@@ -398,7 +498,6 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
     def ik_worker():
         if core_pins.get('ik_worker'):
             _pin_current_thread_to_cores(core_pins['ik_worker'])
-            LOGGER.info(f"[INFO] ik_worker actual affinity after pin: {sorted(os.sched_getaffinity(0))}")
         first_sample = True
         p3d_buffer = deque(maxlen=settings.N)
         num_channel = 3 * len(settings.marker_names)
@@ -412,6 +511,7 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
         ik_class = None
         x_array = u_array = None
         deque_lstm_dict = None
+        markers_handle = None  # persistent viser point-cloud handle, created once below
 
         while True:
             item = infer_q.get()
@@ -461,12 +561,29 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
             t_tri1 = time.perf_counter()
             tri_filt_times.append((t_tri1 - t_tri0) * 1000.0)
 
-            colors = np.zeros_like(augmented_markers.T)
-            colors[0, :] = 1.0
-            colors[1, :] = 0.0
-            colors[2, :] = 0.0
+            colors = np.zeros((augmented_markers.shape[0], 3), dtype=np.uint8)
+            colors[:, 0] = 255  # R
+            colors[:, 1] = 0    # G
+            colors[:, 2] = 0    # B
             t_mviz0 = time.perf_counter()
-            vis_markers.set_object(g.PointCloud(position=augmented_markers.T, color=colors, size=0.02))
+            if markers_handle is None:
+                # First frame only: this actually creates the scene node
+                # (geometry, material, transform) -- comparable in cost to
+                # meshcat's set_object.
+                markers_handle = server.scene.add_point_cloud(
+                    marker_path,
+                    points=augmented_markers.astype(np.float32),
+                    colors=colors,
+                    point_size=0.02,
+                )
+            else:
+                # Every subsequent frame: mutate the existing node's buffers
+                # in place. This is viser's actual fast path -- it sends a
+                # smaller "data changed" message instead of recreating the
+                # whole node, unlike meshcat's set_object which has no
+                # equivalent lightweight update call.
+                markers_handle.points = augmented_markers.astype(np.float32)
+                markers_handle.colors = colors
             marker_viz_times.append((time.perf_counter() - t_mviz0) * 1000.0)
 
             mks_dict = dict(zip(settings.marker_names, augmented_markers))
@@ -490,17 +607,22 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
                     subject_height=settings.human_height
                 )
 
-                viz_human = MeshcatVisualizer(human_model, human_collision_model, human_visual_model)
-                viz_human.initViewer(vis, open=True)
+                viz_human = ViserVisualizer(human_model, human_collision_model, human_visual_model)
+                viz_human.initViewer(viewer=server)
+                viz_human.loadViewerModel(rootNodeName="ref")
 
-                try:
-                    vis["ref"].delete()
-                except Exception:
-                    pass
-                viz_human.loadViewerModel("ref")
+                # loadViewerModel() loads BOTH the collision capsules and the
+                # visual mesh, but only one is actually shown -- and
+                # ViserVisualizer's on/off defaults differ from
+                # MeshcatVisualizer's (which shows visuals, hides collisions,
+                # out of the box). Set explicitly so you get the mesh, not
+                # the capsule mannequin.
+                viz_human.displayCollisions(False)
+                viz_human.displayVisuals(True)
 
-                viz_human.viewer["/Background"].set_property("top_color", [1, 1, 1])
-                viz_human.viewer["/Background"].set_property("bottom_color", [0.65, 0.65, 0.65])
+                # viser has no meshcat-style top/bottom gradient background
+                # property; drop or replace with viser's environment/lighting
+                # controls if you want a custom scene backdrop.
 
                 if settings.ik_type == 'sbs':
                     omega = {key: 1 for key in settings.keys_to_track_list}
@@ -540,6 +662,8 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
                     )
                     human_data = human_model.createData()
 
+                    LOGGER.info("[INFO] Model calibration finished, ready to process...")
+
                     if settings.mhe_backend == 'acados':
                         ik_class = RT_SWIKA_ACADOS(
                             human_model, settings.keys_to_track_list, settings.N, settings.dt,
@@ -576,7 +700,7 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
 
                     t_solve0 = time.perf_counter()
                     x_array, u_array = ik_class.solve(x_array, u_array, array_data,
-                                                       x_array[:, -1], settings.cost_weights, settings.dt)
+                                                        x_array[:, -1], settings.cost_weights, settings.dt)
                     t_solve1 = time.perf_counter()
 
                     q = pin.neutral(human_model)
@@ -586,6 +710,10 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
                     solve_times.append((t_solve1 - t_solve0) * 1000.0)
                 else:
                     raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")
+
+            # Record frame data in-memory if CSV saving is enabled
+            if getattr(settings, "SAVE_CSV", False):
+                saved_data.append((idx, np.asarray(q).flatten().copy(), mks_dict.copy()))
 
             ik_times.append((time.perf_counter() - t0) * 1000.0)
 
@@ -597,13 +725,8 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
                 frame_latency_idx.append(idx)
             with span_lock:
                 if calib_done_ts[0] is None:
-                    # 1st completed frame: paid the calibration cost
-                    # (human model load, meshcat init, first casadi solve).
                     calib_done_ts[0] = done_ts
                 elif warm_done_ts[0] is None:
-                    # 2nd completed frame: paid the first-call cost of the
-                    # steady-state solve path (quadprog JIT / acados-fatrop
-                    # first solve, dlopen, solver memory init, etc.).
                     warm_done_ts[0] = done_ts
                 last_done_ts[0] = done_ts
 
@@ -619,8 +742,6 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
     if calib_done_ts[0] is not None and last_done_ts[0] is not None:
         steady_state_s = last_done_ts[0] - calib_done_ts[0]
 
-    # True steady state: excludes BOTH the calibration frame AND the frame
-    # that paid the first-call compile/JIT cost of the steady-state solve.
     warm_steady_state_s = None
     if warm_done_ts[0] is not None and last_done_ts[0] is not None:
         warm_steady_state_s = last_done_ts[0] - warm_done_ts[0]
@@ -628,7 +749,7 @@ def run_pipelined(src, est, vis, vis_markers, mtxs, dists, projections,
     return (read_times, nlf_times, ik_times, frame_latencies, frame_latency_idx,
             total_first_to_last_s, steady_state_s, warm_steady_state_s,
             tri_filt_times, marker_viz_times, solve_times, display_viz_times,
-            ik_class_out[0])
+            ik_class_out[0], saved_data)
 
 
 def main(args):
@@ -647,13 +768,13 @@ def main(args):
 
     W = settings.width
     H = settings.height
-    mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path)
-    world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
 
     if args.online:
         cameras = list_cameras()
         NUM_CAMERAS = len(cameras)
         FRAME_SHAPE = (H, W, 3)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
+        world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
         camera_buffers, camera_timestamps, camera_locks, frame_counters, camera_barrier, stop_event = create_camera_shared_ressources(NUM_CAMERAS, FRAME_SHAPE)
         results_queues = create_pipeline_shared_ressources()
 
@@ -688,7 +809,7 @@ def main(args):
             num_cameras=NUM_CAMERAS,
         )
 
-        viewer= ViewerProcess(
+        viewer = ViewerProcess(
             settings=settings,
             results_queues=results_queues,
             stop_event=stop_event,
@@ -711,10 +832,19 @@ def main(args):
 
     else: # offline mode
 
-        vis = meshcat.Visualizer()
-        LOGGER.info(f"[INFO] Meshcat visualizer available here: {vis.url()}")
+        server = viser.ViserServer()
+        LOGGER.info(f"[INFO] Viser visualizer available here: http://{server.get_host()}:{server.get_port()}")
 
-        vis_markers = vis["markers"]
+        # Ground grid, matching the floor grid MeshcatVisualizer/pinocchio
+        # shows by default.
+        server.scene.add_grid(
+            "/grid",
+            width=10.0,
+            height=10.0,
+            position=(0.0, 0.0, 0.0),
+        )
+
+        marker_path = "/markers"
 
         if args.videos and len(args.videos) > 0:
             paths = [Path(v) for v in args.videos]
@@ -724,6 +854,8 @@ def main(args):
             raise RuntimeError(f"No videos found in {args.data_dir}")
 
         NUM_CAMERAS = len(paths)
+        mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
+        world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
 
         src = OfflineVideoSource(paths=paths, size_wh=(W, H))
 
@@ -745,6 +877,7 @@ def main(args):
             '-show_entries', 'stream=nb_frames',
             '-of', 'json', str(paths[0])
         ]
+
         result = subprocess.run(cmd, capture_output=True, text=True)
         data = json.loads(result.stdout)
         total_frames = int(data['streams'][0]['nb_frames'])
@@ -752,29 +885,36 @@ def main(args):
 
         stop_event = threading.Event()
 
-        # Core assignment: reserve dedicated cores for ik_worker (acados),
-        # separate from reader/gpu_worker's CPU-side work (YOLO NMS, tensor
-        # preprocessing). ADJUST THESE to match the actual machine -- check
-        # `nproc` / `lscpu` first. This example assumes >=6 usable cores;
-        # if fewer are available, shrink the sets accordingly (they must not
-        # overlap for the pinning to have any effect).
+        # Core assignment: computed from the CPUs this process is ACTUALLY
+        # allowed to use (respects Docker --cpus / cgroup cpuset limits)
         allowed_cpus = _get_allowed_cpus()
-        core_pins = _compute_core_pins(allowed_cpus)
-        LOGGER.info(f"[INFO] Process allowed CPUs: {allowed_cpus}")
-        LOGGER.info(f"[INFO] Computed core pins: {core_pins}")
+
+        if args.no_pin:
+            core_pins = {}
+            LOGGER.info(f"[INFO] Pinning DISABLED (--no-pin). Process allowed CPUs: {allowed_cpus}")
+        else:
+            if args.no_ht:
+                before = allowed_cpus
+                allowed_cpus = _drop_hyperthread_siblings(allowed_cpus)
+                LOGGER.info(f"[INFO] Hyperthreading disabled for this run: "
+                            f"{before} -> {allowed_cpus}")
+
+            core_pins = _compute_core_pins(allowed_cpus)
+            LOGGER.info(f"[INFO] Process allowed CPUs: {allowed_cpus}")
+            LOGGER.info(f"[INFO] Computed core pins: {core_pins}")
 
         (read_times, nlf_times, ik_times, frame_latencies, frame_latency_idx,
          total_first_to_last_s, steady_state_s, warm_steady_state_s,
          tri_filt_times, marker_viz_times, solve_times, display_viz_times,
-         ik_class) = run_pipelined(
-            src, est, vis, vis_markers, mtxs, dists, projections,
+         ik_class, saved_data) = run_pipelined(
+            src, est, server, marker_path, mtxs, dists, projections,
             world_R1_cam, world_T1_cam, settings, total_frames, stop_event,
             core_pins=core_pins
         )
 
-        # Drop BOTH one-time-cost frames: (1) calibration, (2) first-call
-        # compile/JIT spike of the steady-state solve path. Only dropping
-        # one leaves the other spike sitting inside "steady state" stats.
+        
+
+        # Drop ONE-TIME-COST frames (calibration + JIT/first-call spike)
         n_dropped = min(2, len(frame_latencies))
         dropped_idxs = frame_latency_idx[:n_dropped]
         del frame_latencies[:n_dropped]
@@ -782,9 +922,7 @@ def main(args):
         del ik_times[:n_dropped]
         del tri_filt_times[:n_dropped]
         del marker_viz_times[:n_dropped]
-        # solve_times / display_viz_times only ever contain steady-state
-        # frames (calibration doesn't append to them), so only the single
-        # first-call compile-spike entry needs dropping here, not two.
+
         if solve_times:
             solve_times.pop(0)
         if display_viz_times:
@@ -794,39 +932,96 @@ def main(args):
 
         n_processed = len(frame_latencies)
 
-        print("\n--- BENCHMARK RESULTS ---")
-        print(f"Total Video Frames        : {total_frames}")
-        print(f"Frames fully processed    : {n_processed}")
+  # ==============================================================================
+        # 1. BUILD BENCHMARK STATS DICTIONARY (Calculated Once)
+        # ==============================================================================
+        n_processed = len(frame_latencies)
+
+        benchmark_stats = {
+            "Total Video Frames": str(total_frames),
+            "Frames fully processed": str(n_processed),
+        }
+
+        # Pipeline stages
         if read_times:
-            print(f"Read:      mean {np.mean(read_times):.1f} ms | median {np.median(read_times):.1f} ms | max {np.max(read_times):.1f} ms")
+            benchmark_stats["Read"] = f"mean {np.mean(read_times):.1f} ms | median {np.median(read_times):.1f} ms | max {np.max(read_times):.1f} ms"
         if nlf_times:
-            print(f"NLF:       mean {np.mean(nlf_times):.1f} ms | median {np.median(nlf_times):.1f} ms | max {np.max(nlf_times):.1f} ms")
+            benchmark_stats["NLF"] = f"mean {np.mean(nlf_times):.1f} ms | median {np.median(nlf_times):.1f} ms | max {np.max(nlf_times):.1f} ms"
         if ik_times:
-            print(f"IK:        mean {np.mean(ik_times):.1f} ms | median {np.median(ik_times):.1f} ms | max {np.max(ik_times):.1f} ms")
+            benchmark_stats["IK"] = f"mean {np.mean(ik_times):.1f} ms | median {np.median(ik_times):.1f} ms | max {np.max(ik_times):.1f} ms"
+
+        # IK Sub-stage breakdown
+        if tri_filt_times:
+            benchmark_stats["Triangulate+Filter"] = f"mean {np.mean(tri_filt_times):.1f} ms | median {np.median(tri_filt_times):.1f} ms | max {np.max(tri_filt_times):.1f} ms"
+        if marker_viz_times:
+            benchmark_stats["Marker viz (viser point cloud)"] = f"mean {np.mean(marker_viz_times):.1f} ms | median {np.median(marker_viz_times):.1f} ms | max {np.max(marker_viz_times):.1f} ms"
+        if solve_times:
+            benchmark_stats["Solve (ik_class.solve/quadprog)"] = f"mean {np.mean(solve_times):.1f} ms | median {np.median(solve_times):.1f} ms | max {np.max(solve_times):.1f} ms"
+        if display_viz_times:
+            benchmark_stats["Display viz (viser viz_human.display)"] = f"mean {np.mean(display_viz_times):.1f} ms | median {np.median(display_viz_times):.1f} ms | max {np.max(display_viz_times):.1f} ms"
+
+
+        if frame_latencies:
+            benchmark_stats["Full Pipeline (per frame, end-to-end)"] = (
+                f"mean {np.mean(frame_latencies):.1f} ms | "
+                f"median {np.median(frame_latencies):.1f} ms | "
+                f"max {np.max(frame_latencies):.1f} ms"
+            )
+
+        # Spans & Throughput
+        if steady_state_s is not None:
+            benchmark_stats["Post-calibration span (includes first-call compile spike)"] = f"{steady_state_s:.2f} s"
+        if warm_steady_state_s is not None and n_processed > 0:
+            benchmark_stats["Steady-state time (init, compilation and first frame excluded)"] = f"{warm_steady_state_s:.2f} s"
+            benchmark_stats["Steady-state throughput"] = f"{n_processed / warm_steady_state_s:.2f} FPS"
+
+
+        # ==============================================================================
+        # 2. CONSOLE PRINTS (Reading Directly from benchmark_stats)
+        # ==============================================================================
+        print("\n--- BENCHMARK RESULTS ---")
+        print(f"Total Video Frames        : {benchmark_stats['Total Video Frames']}")
+        print(f"Frames fully processed    : {benchmark_stats['Frames fully processed']}")
+        if "Read" in benchmark_stats:
+            print(f"Read:      {benchmark_stats['Read']}")
+        if "NLF" in benchmark_stats:
+            print(f"NLF:       {benchmark_stats['NLF']}")
+        if "IK" in benchmark_stats:
+            print(f"IK:        {benchmark_stats['IK']}")
+
+        if "Full Pipeline (per frame, end-to-end)" in benchmark_stats:
+            print(f"Full Pipeline (per frame): {benchmark_stats['Full Pipeline (per frame, end-to-end)']}")
 
         print("\n--- IK sub-stage breakdown (steady-state frames) ---")
-        if tri_filt_times:
-            print(f"Triangulate+Filter: mean {np.mean(tri_filt_times):.1f} ms | median {np.median(tri_filt_times):.1f} ms | max {np.max(tri_filt_times):.1f} ms")
-        if marker_viz_times:
-            print(f"Marker viz (meshcat set_object): mean {np.mean(marker_viz_times):.1f} ms | median {np.median(marker_viz_times):.1f} ms | max {np.max(marker_viz_times):.1f} ms")
-        if solve_times:
-            print(f"Solve (ik_class.solve/quadprog): mean {np.mean(solve_times):.1f} ms | median {np.median(solve_times):.1f} ms | max {np.max(solve_times):.1f} ms")
-        if display_viz_times:
-            print(f"Display viz (meshcat viz_human.display): mean {np.mean(display_viz_times):.1f} ms | median {np.median(display_viz_times):.1f} ms | max {np.max(display_viz_times):.1f} ms")
+        ik_substages = [
+            "Triangulate+Filter",
+            "Marker viz (viser point cloud)",
+            "Solve (ik_class.solve/quadprog)",
+            "Display viz (viser viz_human.display)"
+        ]
+        for key in ik_substages:
+            if key in benchmark_stats:
+                print(f"{key}: {benchmark_stats[key]}")
 
-        # Anchored right after calibration only (still includes the 2nd
-        # frame's first-call compile spike inside the span).
-        if steady_state_s is not None:
-            print(f"\nPost-calibration span (includes first-call compile spike): {steady_state_s:.2f} s")
+        print()
+        span_keys = [
+            "Post-calibration span (includes first-call compile spike)",
+            "Steady-state time (init, compilation and first frame excluded)",
+            "Steady-state throughput"
+        ]
+        for key in span_keys:
+            if key in benchmark_stats:
+                print(f"{key}: {benchmark_stats[key]}")
 
-        # Anchored right after calibration AND the first-call compile spike.
-        # This is the number that reflects real steady-state running speed.
-        if warm_steady_state_s is not None and n_processed > 0:
-            print(f"Steady-state time (init, compilation and first frame excluded): {warm_steady_state_s:.2f} s")
-            print(f"Steady-state throughput: {n_processed / warm_steady_state_s:.2f} FPS")
 
-        if settings.ik_type == 'mhe' and settings.mhe_backend == 'acados' and ik_class is not None:
-            ik_class.print_core_performance_breakdown()
+        # ==============================================================================
+        # 3. SAVE CSV WITH HEADER METADATA
+        # ==============================================================================
+        if getattr(settings, "SAVE_CSV", False):
+            save_dir = getattr(settings, "SAVE_DIR", "./output")
+            save_joint_angles_csv(saved_data, save_dir, settings, ocp=ik_class, benchmark_stats=benchmark_stats)
+        # if settings.ik_type == 'mhe' and settings.mhe_backend == 'acados' and ik_class is not None:
+        #     ik_class.print_core_performance_breakdown()
 
         src.release()
 
@@ -836,6 +1031,14 @@ if __name__ == "__main__":
     p.add_argument("--online", action="store_true")
     p.add_argument("--data-dir", type=str, default="data", help="Folder containing input videos")
     p.add_argument("--videos", nargs="*", default=None, help="Optional explicit list of input videos")
+    p.add_argument("--no-ht", action="store_true",
+                    help="Treat hyperthread siblings as unavailable for core pinning "
+                         "(container-scoped, no host/root changes -- see "
+                         "_drop_hyperthread_siblings for real host-level SMT-off)")
+    p.add_argument("--no-pin", action="store_true",
+                    help="Disable ALL core pinning -- for baseline comparison "
+                         "profiling (e.g. flamegraph) against the pinned version. "
+                         "Overrides --no-ht (irrelevant when nothing is pinned).")
     args = p.parse_args()
 
     if args.online:
