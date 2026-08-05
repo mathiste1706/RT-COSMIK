@@ -4,27 +4,36 @@ import os
 import cv2 as cv
 import yaml
 
+import glob
+import subprocess
+
 def list_cameras():
     """
-    Use v4l2-ctl to list all connected cameras and their device paths.
-    Return:
-        cameras: dictionary of camera indices and associated device names.
+    Enumerate /dev/video* nodes, keeping only those with actual
+    video-capture format entries (filters out UVC metadata-only nodes,
+    which report 'Video Capture' as a type header but list no formats).
     """
     cameras = {}
-    try:
-        # Get list of video devices
-        output = subprocess.check_output("v4l2-ctl --list-devices", shell=True).decode("utf-8")
-        devices = output.split("\n\n")  # Separate different devices
-        for device in devices:
-            lines = device.split("\n")
-            if len(lines) > 1:
-                device_name = lines[0].strip()
-                video_path = lines[1].strip()
-                if "/dev/video" in video_path:
-                    index = int(video_path.split("video")[-1])
-                    cameras[index] = device_name
-    except Exception as e:
-        print("Error using v4l2-ctl:", e)
+    for path in sorted(glob.glob("/dev/video*")):
+        index = int(path.replace("/dev/video", ""))
+        try:
+            output = subprocess.check_output(
+                f"v4l2-ctl -d {path} --list-formats", shell=True,
+                stderr=subprocess.DEVNULL
+            ).decode("utf-8")
+        except Exception:
+            continue
+
+        # Real capture nodes list entries like "[0]: 'MJPG' ...".
+        # Metadata-only nodes print the "Video Capture" header with
+        # nothing underneath.
+        has_format_entry = any(
+            line.strip().startswith("[") for line in output.splitlines()
+        )
+        if not has_format_entry:
+            continue
+
+        cameras[index] = path
     return cameras
 
 def rt_to_homogeneous(R, translation_matrix):
@@ -153,13 +162,14 @@ def load_cam_pose(filename):
             rotation_matrix (np.ndarray): The 3x3 rotation matrix.
             translation_matrix (np.ndarray): The 3x1 translation matrix.
     """
-
     with open(filename, 'r') as file:
         data = yaml.safe_load(file)
 
-    rotation_matrix = np.array(data['rotation_matrix']['data']).reshape((3, 3))
-    translation_matrix = np.array(data['translation_vector']['data']).reshape((3, 1))
-    
+    extrinsics = data['camera_extrinsics']
+
+    rotation_matrix = np.array(extrinsics['rotation_matrix']).reshape((3, 3))
+    translation_matrix = np.array(extrinsics['translation_vector']).reshape((3, 1))
+
     return rotation_matrix, translation_matrix
 
 def load_camera_parameters(config_path, num_cameras=2):
@@ -177,7 +187,8 @@ def load_camera_parameters(config_path, num_cameras=2):
         rotation_list (list of np.ndarray): Camera rotation matrices, each with shape (3, 3).
         translation_list (list of np.ndarray): Camera translation matrices, each with shape (3, 1).
     """
-
+    if num_cameras % 2 != 0 or num_cameras < 2:
+        raise ValueError("Number of cameras must be an even integer greater than or equal to 2.")
     
     mtx_list = []
     dist_list = []
@@ -188,7 +199,7 @@ def load_camera_parameters(config_path, num_cameras=2):
     for i in range(num_cameras):
         cam_nb = i * 2
         
-        K, D = load_cam_params(os.path.join(config_path, f"c{cam_nb}_params_color.yaml"))
+        K, D = load_cam_params(os.path.join(config_path, f"camera_{cam_nb}_intrinsics.yaml"))
         mtx_list.append(np.array(K))
         dist_list.append(D)
 
@@ -198,9 +209,9 @@ def load_camera_parameters(config_path, num_cameras=2):
             translation = np.zeros((3, 1))
         else:
             # All subsequent cameras read their file relative to c0
-            extrinsic_file = os.path.join(config_path, f"c0_to_c{cam_nb}_params_color.yaml")
+            extrinsic_file = os.path.join(config_path, f"camera_0_to_camera_{cam_nb}.yaml")
             R, translation = load_cam_to_cam_params(extrinsic_file)
-            
+
             R = np.array(R)
             translation = np.array(translation).reshape(3, 1) # Force standard 3x1 vertical vector layout
 
@@ -221,5 +232,5 @@ def load_world_transformation(config_path):
         world_R1_cam (np.ndarray): The rotation matrix from camera 0 to the world.
         world_translation1_cam (np.ndarray): The translation matrix from camera 0 to the world.
     """
-    world_R1_cam, world_translation1_cam = load_cam_pose(os.path.join(config_path, "camera0_pose.yaml"))
+    world_R1_cam, world_translation1_cam = load_cam_pose(os.path.join(config_path, "camera_0_extrinsics.yaml"))
     return world_R1_cam, world_translation1_cam.reshape((3,))
