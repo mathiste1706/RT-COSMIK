@@ -11,7 +11,7 @@ ManualViserRobotVisualizer mirrors the small subset of MeshcatVisualizer's
 API this pipeline actually uses (initViewer / loadViewerModel / display), so
 it's a close to drop-in replacement for pinocchio's ViserVisualizer.
 
-Requires: pip install trimesh
+Requires: pip install trimesh --break-system-packages   (if not already installed)
 """
 import numpy as np
 import pinocchio as pin
@@ -114,7 +114,8 @@ class ManualViserRobotVisualizer:
                 self._handles.append(None)
                 continue
             # Index-prefixed path guarantees uniqueness even if multiple
-            # geometries share a name or parent joint 
+            # geometries share a name or parent joint -- this is exactly
+            # what ViserVisualizer's loadViewerModel was getting wrong.
             path = f"/{self.root}/{i:03d}_{geom_obj.name}"
             handle = self.server.scene.add_mesh_trimesh(path, mesh)
             self._handles.append(handle)
@@ -191,6 +192,9 @@ class Viewer:
         self._markers_handle = None
 
         # Init viser visualizer for human
+        # NOTE: `initViewer` signature for ViserVisualizer may differ slightly
+        # from MeshcatVisualizer depending on your pinocchio version — check
+        # `help(ViserVisualizer.initViewer)` if this errors and adjust.
         self.viz_human = ViserVisualizer(self.model, self.collision_model, self.visual_model)
         self.viz_human.initViewer(viewer=self.server)
         self.viz_human.loadViewerModel(rootNodeName="ref")
