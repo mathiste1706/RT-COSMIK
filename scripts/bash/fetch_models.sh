@@ -52,14 +52,14 @@ ASSET_L="nlf_l_multi_0.3.2.torchscript"
 download_release_asset "${NLF_OWNER}" "${NLF_REPO}" "${TAG_S}" "${ASSET_S}" "${NLF_DIR}/${ASSET_S}"
 download_release_asset "${NLF_OWNER}" "${NLF_REPO}" "${TAG_L}" "${ASSET_L}" "${NLF_DIR}/${ASSET_L}"
 
-# -------- YOLOv10n weights download --------
-# YOLOv10 pretrained weights are in THU-MIG/yolov10 release v1.1: yolov10n.pt :contentReference[oaicite:2]{index=2}
-YOLO_OWNER="THU-MIG"
-YOLO_REPO="yolov10"
-YOLO_TAG="v1.1"
-YOLO_ASSET="yolov10n.pt"
+# -------- YOLO26n weights download --------
+# YOLO26 pretrained weights are published in ultralytics/assets release v8.4.0: yolo26n.pt
+YOLO_OWNER="ultralytics"
+YOLO_REPO="assets"
+YOLO_TAG="v8.4.0"
+YOLO_ASSET="yolo26n.pt"
 YOLO_PT="${YOLO_DIR}/${YOLO_ASSET}"
-YOLO_ENGINE="${YOLO_DIR}/yolov10n.engine"
+YOLO_ENGINE="${YOLO_DIR}/yolo26n.engine"
 
 download_release_asset "${YOLO_OWNER}" "${YOLO_REPO}" "${YOLO_TAG}" "${YOLO_ASSET}" "${YOLO_PT}"
 
@@ -68,10 +68,29 @@ DEVICE="${DEVICE:-0}"
 BATCH=2
 IMGSZ=640
 
+if [[ -z "${YOLO_PT:-}" ]]; then
+  echo "[ERR] YOLO_PT is empty — model path was not set before export." >&2
+  exit 1
+fi
+
+META_PATH="${YOLO_ENGINE}.meta"
+
+needs_export=1
+if [[ -f "${YOLO_ENGINE}" && -f "${META_PATH}" ]]; then
+  IFS=',' read -r meta_batch meta_imgsz < "${META_PATH}"
+  if [[ "${meta_batch}" -eq "${BATCH}" && "${meta_imgsz}" -eq "${IMGSZ}" ]]; then
+    needs_export=0
+  fi
+fi
+
+if [[ "${needs_export}" -eq 0 ]]; then
+  echo "[OK] TensorRT engine already exists with matching batch=${BATCH}, imgsz=${IMGSZ}: ${YOLO_ENGINE}"
+  exit 0
+fi
 
 if [[ -f "${YOLO_ENGINE}" ]]; then
-  echo "[OK] TensorRT engine already exists: ${YOLO_ENGINE}"
-  exit 0
+  echo "[INFO] Existing engine found but batch/imgsz mismatch (meta: batch=${meta_batch:-none}, imgsz=${meta_imgsz:-none}; wanted: batch=${BATCH}, imgsz=${IMGSZ}). Rebuilding."
+  rm -f "${YOLO_ENGINE}" "${META_PATH}"
 fi
 
 if ! command -v yolo >/dev/null 2>&1; then
@@ -91,7 +110,7 @@ for m in ("onnx","tensorrt"):
         print("[WARN] cannot import", m, "->", e)
 PY
 
-echo "[INFO] Exporting TensorRT engine on device=${DEVICE}"
+echo "[INFO] Exporting TensorRT engine on device=${DEVICE} from ${YOLO_PT}"
 
 # Run export and capture logs
 LOG="$(mktemp)"
@@ -101,10 +120,9 @@ yolo export \
   device="${DEVICE}" \
   imgsz=${IMGSZ} \
   batch=${BATCH} \
+  quantize=16 \
   dynamic=False \
   simplify=False | tee "${LOG}"
-
- 
 
 # Double-check that the file built successfully
 if [[ ! -f "${YOLO_ENGINE}" ]]; then
@@ -112,8 +130,7 @@ if [[ ! -f "${YOLO_ENGINE}" ]]; then
   exit 2
 fi
 
-# Write sidecar configuration file right next to it as yolov10n.engine.meta
-META_PATH="${YOLO_ENGINE}.meta"
+# Write sidecar configuration file right next to it as yolo26n.engine.meta
 echo "${BATCH},${IMGSZ}" > "${META_PATH}"
 
 echo "[OK] Export completed successfully!"
