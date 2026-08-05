@@ -1,5 +1,7 @@
 import numpy as np
+import os
 import torch
+import torchvision
 from ultralytics import YOLO
 import logging
 import time
@@ -12,6 +14,88 @@ from multiprocessing import Process, Array, Value, Lock, Barrier, Event, Queue
 from rtcosmik.triangulation.triangulation import triangulate_points
 
 LOGGER = logging.getLogger(__name__)
+
+
+def check_yolo_engine(num_cameras, imgsz=640, device=0):
+    """
+    Checks if yolov10n.engine matches the required camera count profile and if not rebatched YOLO.
+    Parameters:
+        num_cameras (int): Number of cameras used
+        imgsz (int, optional): Image size (height, width) in pixels. Defaults to 640.
+        device (int, optional): Device index. Defaults to 0.
+    """
+    yolo_dir = "/root/workspace/RT-COSMIK/weights/yolo"
+    pt_weight_path = os.path.join(yolo_dir, "yolo26n.pt")
+    expected_engine_path = os.path.join(yolo_dir, "yolo26n.engine")
+    
+    # Inspect existing engine layout safely using direct binary parsing
+    if os.path.exists(expected_engine_path):
+        print(f"[INFO] Engine file found at {expected_engine_path}. Verifying layout metadata via stream...")
+        try:
+            
+            meta_path = expected_engine_path + ".meta"
+            
+            if os.path.exists(meta_path):
+                with open(meta_path, "r") as f:
+                    meta_data = f.read().strip().split(",")
+                
+                actual_batch = int(meta_data[0])
+                actual_imgsz = int(meta_data[1])
+                
+                if actual_batch == num_cameras and actual_imgsz == imgsz:
+                    print(f"[OK] Verified engine configuration matches. Skipping compilation.")
+                    return expected_engine_path
+                else:
+                    print(f"[WARN] Engine profile mismatch. Found Batch {actual_batch}, Size {actual_imgsz}. Need Batch {num_cameras}. Rebuilding...")
+            else:
+                print("[WARN] Engine metadata tracker missing. Forcing compilation to sync configurations.")
+                    
+        except Exception as e:
+            print(f"[WARN] Failed to read engine framework metadata safely ({e}). Forcing compilation rebuild.")
+
+    # Validation failed or file missing -> Trigger programmatic compilation pipeline
+    print(f"[INFO] Compiling a new TensorRT engine for Batch {num_cameras}...")
+    if not os.path.exists(pt_weight_path):
+        raise FileNotFoundError(f"Base PyTorch weights file missing at {pt_weight_path}. Run download sequence first.")
+
+    try:
+        # Load the floating point PyTorch framework weights
+        model = YOLO(pt_weight_path)
+        
+        # Compile static graph optimized layout directly targeting the active camera count
+        exported_path = model.export(
+            format="engine",
+            device=device,
+            imgsz=imgsz,
+            batch=num_cameras,
+            dynamic=False,
+            simplify=False,
+            quantize=16
+        )
+        
+        # Clean up the pipeline output path and rename to exact target format
+        if exported_path and os.path.exists(exported_path):
+            if os.path.abspath(exported_path) != os.path.abspath(expected_engine_path):
+                # Erase the outdated mismatched or corrupted file layout completely
+                if os.path.exists(expected_engine_path):
+                    os.remove(expected_engine_path)
+                    
+                shutil.move(exported_path, expected_engine_path)
+            
+            # Write a companion metadata file to have its configuration shape!
+            meta_path = expected_engine_path + ".meta"
+            with open(meta_path, "w") as f:
+                f.write(f"{num_cameras},{imgsz}")
+                
+            print(f"[OK] Successfully wrote verified engine and configuration metadata to: {expected_engine_path}")
+            return expected_engine_path
+        else:
+            raise RuntimeError("YOLO export finished but target engine file could not be verified.")
+            
+    except Exception as e:
+        print(f"[ERR] Automated TensorRT export execution failed: {e}")
+        raise
+
 
 class NLFEstimator:
     """Roll YOLO detection (batched) + per-camera NLF sequential estimation for multiple images."""
@@ -119,7 +203,7 @@ class NLFEstimator:
             for _ in range(iters):
                 _ = self.yolo.predict(
                     frames, imgsz=self.imgsz, classes=0, conf=self.conf,
-                    device=self.device, verbose=False, half=True,
+                    device=self.device, verbose=False, quantize=16,
                 )
 
         with torch.inference_mode():
@@ -277,7 +361,7 @@ class NLFEstimator:
         # YOLO
         yres = self.yolo.predict(
             frames_bgr, imgsz=self.imgsz, classes=0, conf=self.conf,
-            device=self.device, verbose=False, half=True
+            device=self.device, verbose=False, quantize=16
         )
 
         t1 = time.perf_counter()
