@@ -3,23 +3,15 @@ import torch
 import numpy as np
 import pinocchio as pin
 import example_robot_data as robex
-from datetime import datetime
-from multiprocessing import Process, Array, Lock, Value, Event, Queue
+from multiprocessing import Process,Event, Queue
 from typing import List
-import time
-
-import viser
-# ViserVisualizer (from pinocchio.visualize) drops/mis-attaches multi-geometry
-# bodies -- see ManualViserRobotVisualizer in rtcosmik/viewer/viewer.py for
-# the diagnosis. Using that manual loader instead until this is fixed upstream.
-from rtcosmik.viewer.viewer import ManualViserRobotVisualizer as ViserVisualizer
+import cv2
 
 from rtcosmik.nlf.nlf import NLFEstimator
 from rtcosmik.triangulation.triangulation import triangulate_points
 from rtcosmik.filtering.iir import IIR
 from rtcosmik.human_model.model_utils import scale_human_model, mks_registration, recalibrate_marker_frames_in_joint_space
 from rtcosmik.ik.ik import RT_IK, RT_SWIKA_FATROP, RT_SWIKA_ACADOS
-from rtcosmik.camera.cam_utils import load_camera_parameters,load_world_transformation
 
 import logging
 
@@ -41,6 +33,7 @@ class PipelineProcess(Process):
                  world_T1_cam,
                  frame_shape: tuple = (720, 1280, 3),
                  num_cameras: int = 2,
+                 show_nlf: bool = False,
                  logger=None,
                  ):
         super().__init__()
@@ -56,10 +49,12 @@ class PipelineProcess(Process):
         self.last_frame_counters = [0] * self.num_cameras
         self.frame_counters = frame_counters
 
-        # Settings related parameters
         self.settings=settings
 
-        # Others, cam parameters
+        # If True, pops up a live cv2 window showing YOLO boxes + NLF 2D
+        # keypoints overlaid per camera, side by side, every frame.
+        self.show_nlf = show_nlf
+
         self.first_sample = True
 
         self.p3d_buffer=deque(maxlen=self.settings.N)
@@ -74,10 +69,6 @@ class PipelineProcess(Process):
         self.logger = logger or LOGGER
 
     def run(self):
-
-        server = None
-        viz_human = None
-        markers_handle = None  # persistent viser point-cloud handle, created once below
 
         est = NLFEstimator(
             yolo_path=self.settings.yolo_path,
@@ -125,6 +116,18 @@ class PipelineProcess(Process):
 
                     nlf_out, infer_ms, yres, boxes = est.estimate_from_frames(frames)
 
+                    if self.show_nlf:
+                        vis_frames = est.visualize_frames(
+                            frames,
+                            nlf_out,
+                            boxes=boxes,
+                            draw_boxes=True,
+                            put_text=True,
+                            text_prefix="cam",
+                        )
+                        cv2.imshow("NLF Output", np.hstack(vis_frames))
+                        cv2.waitKey(1)
+
                     nlf_out_2d = nlf_out["poses2d"]
 
                     if nlf_out_2d is None or len(nlf_out_2d) < self.num_cameras:
@@ -171,18 +174,11 @@ class PipelineProcess(Process):
 
                         augmented_markers=filtered_p3d_buffer[-1]
 
-                        # Subsequent frames: mutate buffers in place
-                        # instead of recreating the node.
-                        markers_handle.points = augmented_markers.astype(np.float32)
-                        markers_handle.colors = colors
-
                         if self.first_sample:
                             mks_dict = dict(zip(self.settings.marker_names, augmented_markers))
 
                             human = robex.human.HumanLoader(height=self.settings.human_height, weight=self.settings.human_weight, gender=self.settings.human_gender).robot
                             human_model = human.model
-                            human_collision_model = human.collision_model
-                            human_visual_model = human.visual_model
 
                             #scale the model to data
                             human_model = scale_human_model(human_model, mks_dict, gender=self.settings.human_gender, subject_height=self.settings.human_height)
@@ -199,9 +195,6 @@ class PipelineProcess(Process):
 
                                 q = ik_class.solve_ik_sample_casadi()
                                 ik_class._q0 = q
-
-                                if viz_human is not None:
-                                    viz_human.display(q)
 
                                 # Recalibrate briefly the markers translation in joint frames
                                 human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,self.settings.marker_names)
@@ -226,9 +219,6 @@ class PipelineProcess(Process):
                                 q = pin.neutral(human_model)
                                 q[:] = np.array(x_array[:human_model.nq,-1]).flatten()
 
-                                if viz_human is not None:
-                                    viz_human.display(q)
-
                                 # Recalibrate briefly the markers translation in joint frames
                                 human_model=recalibrate_marker_frames_in_joint_space(human_model,q,mks_dict,self.settings.marker_names)
 
@@ -251,8 +241,6 @@ class PipelineProcess(Process):
                                 ik_class._dict_m = mks_dict
                                 q = ik_class.solve_ik_sample_quadprog() 
                                 ik_class._q0 = q
-                                if viz_human is not None:
-                                    viz_human.display(q)
                                 self.results_queues[1].put((new_counters, q))
 
                             elif self.settings.ik_type == 'mhe':
@@ -263,10 +251,10 @@ class PipelineProcess(Process):
 
                                 q = pin.neutral(human_model)
                                 q[:] = np.array(x_array[:human_model.nq,-1]).flatten()
-                                if viz_human is not None:
-                                    viz_human.display(q)
                                 self.results_queues[1].put((new_counters, q))
                             else : 
                                 raise ValueError("Invalid ik type, should be sbs (sample by sample) or mhe (moving horizon estimation)")
-        finally:        
+        finally:
+            if self.show_nlf:
+                cv2.destroyAllWindows()
             self.logger.info("[INFO] Pipeline Process terminated")

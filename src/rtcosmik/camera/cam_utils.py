@@ -187,8 +187,8 @@ def load_camera_parameters(config_path, num_cameras=2):
         rotation_list (list of np.ndarray): Camera rotation matrices, each with shape (3, 3).
         translation_list (list of np.ndarray): Camera translation matrices, each with shape (3, 1).
     """
-    if num_cameras % 2 != 0 or num_cameras < 2:
-        raise ValueError("Number of cameras must be an even integer greater than or equal to 2.")
+    # if num_cameras % 2 != 0 or num_cameras < 2:
+    #     raise ValueError("Number of cameras must be an even integer greater than or equal to 2.")
     
     mtx_list = []
     dist_list = []

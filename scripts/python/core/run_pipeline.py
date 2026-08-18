@@ -13,13 +13,14 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import viser
+import cv2
 
 from rtcosmik.utils.videoReader import OfflineVideoSource, list_videos
 import numpy as np
 import torch
 import pinocchio as pin
 
-from rtcosmik.viewer.viewer import ManualViserRobotVisualizer as ViserVisualizer
+from rtcosmik.viewer.viewer import ViserRobotVisualizer
 
 from rtcosmik.config_loader import settings
 from rtcosmik.nlf.nlf import NLFEstimator, DisplayConsumerNLF
@@ -39,10 +40,9 @@ import example_robot_data as robex
 
 import logging
 
-import os
-import ctypes
 import subprocess
 import json
+import re
 
 import threading
 import queue
@@ -63,11 +63,22 @@ JOINT_ANGLES_NAMES = [
     'Rknee_flex_ext', 'Rankle_flex_ext', 'Rankle_abd_add'
 ]
 
-import logging
-from pathlib import Path
-
 LOGGER = logging.getLogger(__name__)
 
+
+def _extract_cam_id(name) -> Optional[int]:
+    """Extract the integer camera ID encoded in `name`, matching the
+    'camera_N' naming scheme used in video filenames (e.g. 'camera_2.mp4').
+    Used only for offline mode, where the ID is real, deterministic data
+    burned into the filename -- unlike online mode, where bus enumeration
+    order is arbitrary and --camera-index is a fixed positional convention
+    instead (see the online branch in main()).
+
+    Returns None if no matching pattern is found.
+    """
+    s = str(name)
+    m = re.search(r'camera_(\d+)', s, re.IGNORECASE)
+    return int(m[1]) if m else None
 
 
 def save_joint_angles_csv(saved_data, save_dir, settings, ocp=None, benchmark_stats=None):
@@ -107,11 +118,16 @@ def save_joint_angles_csv(saved_data, save_dir, settings, ocp=None, benchmark_st
                 return None
             visited.add(id(obj))
 
-            # 1. Direct attribute check
-            if hasattr(obj, key):
-                val = getattr(obj, key, None)
-                if val is not None and not callable(val):
-                    return val
+            # 1. Direct attribute check (wrapped: some solver objects raise
+            # non-AttributeError exceptions from property getters, e.g.
+            # acados/fatrop wrappers touching a compiled/CasADi backend)
+            try:
+                if hasattr(obj, key):
+                    val = getattr(obj, key, None)
+                    if val is not None and not callable(val):
+                        return val
+            except Exception:
+                pass
 
             # 2. Dictionary check
             if isinstance(obj, dict) and key in obj and obj[key] is not None:
@@ -174,115 +190,7 @@ def save_joint_angles_csv(saved_data, save_dir, settings, ocp=None, benchmark_st
     LOGGER.info(
         f"[INFO] Successfully saved {len(saved_data)} frames with benchmarks and parameters to {csv_file.resolve()}"
     )
-LOGGER = logging.getLogger(__name__)
 
-
-def _get_allowed_cpus():
-    """The actual CPU IDs this process may run on, respecting cgroup/cpuset
-    limits (Docker --cpus, Kubernetes resources.limits.cpu, taskset, etc).
-    This is authoritative -- unlike lscpu/nproc, which can show host-wide
-    topology even inside a restricted container."""
-    try:
-        return sorted(os.sched_getaffinity(0))
-    except Exception:
-        return list(range(os.cpu_count() or 1))
-
-
-def _drop_hyperthread_siblings(cpu_ids):
-    """Keep only ONE logical CPU per physical core, dropping the rest.
-
-    This makes the pipeline behave as if hyperthreading were off, WITHOUT
-    touching the host's actual SMT state (no /sys writes, no root needed,
-    no effect on other processes/containers sharing the machine). It's
-    container-scoped and fully reversible just by not calling this.
-
-    Real host-level SMT off (if you have it and want the host-wide effect
-    instead) is a separate, one-line terminal action:
-        echo off > /sys/devices/system/cpu/smt/control   # requires --privileged
-        echo on  > /sys/devices/system/cpu/smt/control   # to re-enable
-    """
-    seen_cores = set()
-    kept = []
-    for cpu in cpu_ids:
-        core = _get_physical_core_id(cpu)
-        if core in seen_cores:
-            continue
-        seen_cores.add(core)
-        kept.append(cpu)
-    return kept
-
-
-def _get_physical_core_id(cpu_id):
-    """Physical core ID for a logical CPU, to detect hyperthread siblings."""
-    try:
-        path = f"/sys/devices/system/cpu/cpu{cpu_id}/topology/core_id"
-        with open(path) as f:
-            return int(f.read().strip())
-    except Exception:
-        return cpu_id  # fallback: treat as its own isolated core
-
-
-def _compute_core_pins(allowed_cpus):
-    """Split the CPUs this process is actually allowed to use across the
-    three pipeline stages, preferring to give ik_worker a physical core that
-    reader/gpu_worker don't share (via hyperthreading) when there's enough
-    room. Falls back to an even split of raw CPU IDs if physical-core
-    detection fails or too few distinct cores are available to isolate.
-    """
-    by_core = {}
-    for cpu in allowed_cpus:
-        core = _get_physical_core_id(cpu)
-        by_core.setdefault(core, []).append(cpu)
-    physical_cores = list(by_core.values())  # list of CPU-id lists, grouped by physical core
-
-    if len(physical_cores) >= 3:
-        # Enough distinct physical cores to give each stage its own.
-        reader_cpus = physical_cores[0]
-        gpu_cpus = [c for core in physical_cores[1:-1] for c in core]
-        ik_cpus = physical_cores[-1]
-    elif len(physical_cores) == 2:
-        # Two physical cores only: isolate ik_worker on one entirely,
-        # let reader+gpu_worker share the other.
-        reader_cpus = physical_cores[0]
-        gpu_cpus = physical_cores[0]
-        ik_cpus = physical_cores[1]
-    else:
-        # One physical core (or topology detection failed): can't isolate
-        # anything meaningfully -- just split the raw CPU list evenly.
-        n = len(allowed_cpus)
-        third = max(1, n // 3)
-        reader_cpus = allowed_cpus[:third] or allowed_cpus[:1]
-        gpu_cpus = allowed_cpus[third:2 * third] or allowed_cpus[:1]
-        ik_cpus = allowed_cpus[2 * third:] or allowed_cpus[-1:]
-
-    return {'reader': reader_cpus, 'gpu_worker': gpu_cpus, 'ik_worker': ik_cpus}
-
-
-def _pin_current_thread_to_cores(core_ids):
-    """Pin the calling OS thread to a specific set of CPU cores (Linux only).
-
-    This is per-THREAD affinity, separate from OMP_NUM_THREADS/OMP_PROC_BIND env
-    vars (which only govern threads spawned inside OpenMP-parallel regions).
-    Used here to keep ik_worker's acados solve() off the same physical cores
-    as reader/gpu_worker's CPU-side work (YOLO NMS, tensor preprocessing),
-    reducing cache/scheduler contention between them.
-    """
-    try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        cpu_set_t_size = 128  # bytes, generous upper bound for CPU_SETSIZE
-        mask = (ctypes.c_uint8 * cpu_set_t_size)()
-        for core_id in core_ids:
-            mask[core_id // 8] |= (1 << (core_id % 8))
-        SYS_gettid = 186  # x86_64; use 178 on aarch64 if needed
-        tid = libc.syscall(SYS_gettid)
-        ret = libc.sched_setaffinity(tid, cpu_set_t_size, ctypes.byref(mask))
-        if ret != 0:
-            errno = ctypes.get_errno()
-            LOGGER.warning(f"[WARN] sched_setaffinity failed for cores {core_ids}: errno={errno}")
-        else:
-            LOGGER.info(f"[INFO] Pinned thread (tid={tid}) to cores {core_ids}")
-    except Exception as exc:
-        LOGGER.warning(f"[WARN] Could not set CPU affinity to {core_ids}: {exc}")
 
 # -----------------------
 # Viser debug helpers
@@ -427,16 +335,15 @@ def update_measured_markers(marker_handles: dict, mks_dict: dict):
 
 def run_pipelined(src, est, server, marker_path, mtxs, dists, projections,
                    world_R1_cam, world_T1_cam, settings, total_frames, stop_event,
-                   core_pins=None):
-    """core_pins: optional dict like {'reader': [0], 'gpu_worker': [1,2,3],
-    'ik_worker': [4,5]} to pin each worker thread to specific CPU cores.
-    Pass None (default) to skip pinning entirely.
+                   show_nlf=False, visualizer="viser"):
+    """`server` is the shared display backend instance -- a viser.ViserServer
+    if `visualizer == "viser"`, or a meshcat.Visualizer if
+    `visualizer == "meshcat"`. `marker_path` is the scene path the live
+    measured-marker point cloud is published under (e.g. "/markers").
 
-    `server` is the shared viser.ViserServer instance; `marker_path` is the
-    scene path the live measured-marker point cloud is published under
-    (e.g. "/markers")."""
-    core_pins = core_pins or {}
-
+    `show_nlf`: if True, pops up a live cv2 window in gpu_worker showing
+    YOLO boxes + NLF 2D keypoints overlaid per camera, side by side.
+    """
     frame_q = queue.Queue(maxsize=3)
     infer_q = queue.Queue(maxsize=3)
     SENTINEL = None
@@ -458,13 +365,11 @@ def run_pipelined(src, est, server, marker_path, mtxs, dists, projections,
     span_lock = threading.Lock()
 
     ik_class_out = [None]         # holds the constructed ik_class after calibration, for post-run diagnostics
-    
+
     # In-memory storage for offline joint angle & marker logging (avoids disk blocking in ik_worker)
     saved_data = []
 
     def reader():
-        if core_pins.get('reader'):
-            _pin_current_thread_to_cores(core_pins['reader'])
         idx = 0
         while not stop_event.is_set() and idx < total_frames:
             t0 = time.perf_counter()
@@ -482,8 +387,6 @@ def run_pipelined(src, est, server, marker_path, mtxs, dists, projections,
         frame_q.put(SENTINEL)
 
     def gpu_worker():
-        if core_pins.get('gpu_worker'):
-            _pin_current_thread_to_cores(core_pins['gpu_worker'])
         while True:
             item = frame_q.get()
             if item is SENTINEL:
@@ -493,17 +396,35 @@ def run_pipelined(src, est, server, marker_path, mtxs, dists, projections,
             t0 = time.perf_counter()
             nlf_out, infer_ms, yres, boxes = est.estimate_from_frames(frames)
             nlf_times.append((time.perf_counter() - t0) * 1000.0)
+
+            if show_nlf:
+                vis_frames = est.visualize_frames(
+                    frames,
+                    nlf_out,
+                    boxes=boxes,
+                    draw_boxes=True,
+                    put_text=True,
+                    text_prefix="cam",
+                )
+                cv2.imshow("NLF Output", np.hstack(vis_frames))
+                cv2.waitKey(1)
+
             infer_q.put((idx, frames, nlf_out, boxes))
 
     def ik_worker():
-        if core_pins.get('ik_worker'):
-            _pin_current_thread_to_cores(core_pins['ik_worker'])
         first_sample = True
         p3d_buffer = deque(maxlen=settings.N)
         num_channel = 3 * len(settings.marker_names)
         iir_filter = IIR(num_channel=num_channel, sampling_frequency=settings.fs)
         iir_filter.add_filter(order=settings.order, cutoff=settings.cutoff_freq,
                                filter_type=settings.filter_type)
+
+        # Resolved once here instead of re-imported every frame in the hot
+        # loop below (module lookup + attribute bind on every iteration adds
+        # up at tens-of-Hz).
+        mc_geometry = None
+        if visualizer == "meshcat":
+            import meshcat.geometry as mc_geometry
 
         human_model = None
         human_data = None
@@ -566,7 +487,17 @@ def run_pipelined(src, est, server, marker_path, mtxs, dists, projections,
             colors[:, 1] = 0    # G
             colors[:, 2] = 0    # B
             t_mviz0 = time.perf_counter()
-            if markers_handle is None:
+            if visualizer == "meshcat":
+                # meshcat has no lightweight "mutate existing node" call like
+                # viser's handle.points/.colors -- set_object every frame is
+                # the normal meshcat update path (same as Viewer.display_markers).
+                mc_colors = np.zeros((3, augmented_markers.shape[0]), dtype=np.float32)
+                mc_colors[0, :] = 1.0  # R, meshcat wants (3,N) floats in [0,1]
+                server[marker_path].set_object(
+                    mc_geometry.PointCloud(position=augmented_markers.T.astype(np.float32),
+                                            color=mc_colors, size=0.02)
+                )
+            elif markers_handle is None:
                 # First frame only: this actually creates the scene node
                 # (geometry, material, transform) -- comparable in cost to
                 # meshcat's set_object.
@@ -607,18 +538,24 @@ def run_pipelined(src, est, server, marker_path, mtxs, dists, projections,
                     subject_height=settings.human_height
                 )
 
-                viz_human = ViserVisualizer(human_model, human_collision_model, human_visual_model)
-                viz_human.initViewer(viewer=server)
-                viz_human.loadViewerModel(rootNodeName="ref")
+                if visualizer == "meshcat":
+                    from pinocchio.visualize import MeshcatVisualizer
+                    viz_human = MeshcatVisualizer(human_model, human_collision_model, human_visual_model)
+                    viz_human.initViewer(server, open=False)
+                    viz_human.loadViewerModel("ref")
+                else:
+                    viz_human = ViserRobotVisualizer(human_model, human_collision_model, human_visual_model)
+                    viz_human.initViewer(viewer=server)
+                    viz_human.loadViewerModel(rootNodeName="ref")
 
-                # loadViewerModel() loads BOTH the collision capsules and the
-                # visual mesh, but only one is actually shown -- and
-                # ViserVisualizer's on/off defaults differ from
-                # MeshcatVisualizer's (which shows visuals, hides collisions,
-                # out of the box). Set explicitly so you get the mesh, not
-                # the capsule mannequin.
-                viz_human.displayCollisions(False)
-                viz_human.displayVisuals(True)
+                    # loadViewerModel() loads BOTH the collision capsules and the
+                    # visual mesh, but only one is actually shown -- and
+                    # ViserRobotVisualizer's on/off defaults differ from
+                    # MeshcatVisualizer's (which shows visuals, hides collisions,
+                    # out of the box). Set explicitly so you get the mesh, not
+                    # the capsule mannequin.
+                    viz_human.displayCollisions(False)
+                    viz_human.displayVisuals(True)
 
                 # viser has no meshcat-style top/bottom gradient background
                 # property; drop or replace with viser's environment/lighting
@@ -734,6 +671,9 @@ def run_pipelined(src, est, server, marker_path, mtxs, dists, projections,
     for t in threads: t.start()
     for t in threads: t.join()
 
+    if show_nlf:
+        cv2.destroyAllWindows()
+
     total_first_to_last_s = None
     if first_read_ts[0] is not None and last_done_ts[0] is not None:
         total_first_to_last_s = last_done_ts[0] - first_read_ts[0]
@@ -757,12 +697,6 @@ def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # PyTorch has its own CPU thread pools (intra-op / inter-op), separate from
-    # OMP_NUM_THREADS/OMP_PROC_BIND env vars, which only govern OpenMP-parallel
-    # regions. Left unconstrained, these can spawn multi-core thread pools during
-    # YOLO NMS / tensor preprocessing that compete with ik_worker's acados solve
-    # for the same physical cores. Pin both to 1 to remove that source of
-    # contention; combine with core affinity pinning below for the full effect.
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
@@ -771,6 +705,33 @@ def main(args):
 
     if args.online:
         cameras = list_cameras()
+
+        if args.camera_index is not None:
+            # Online: enumeration order on the bus is out of our control and
+            # tells us nothing about physical identity. --camera-index here
+            # is a FIXED convention, not a lookup into device data: label 0
+            # always means "1st detected camera", 2 means "2nd", 4 means
+            # "3rd", 6 means "4th", i.e. position = label // 2. This is
+            # independent of whatever list_cameras() actually returns.
+            cam_keys = list(cameras.keys())
+            selected = {}
+            for label in args.camera_index:
+                if label < 0 or label % 2 != 0:
+                    raise RuntimeError(
+                        f"--camera-index {label}: online camera labels follow the fixed "
+                        f"0, 2, 4, 6, ... convention (position = label // 2); "
+                        f"got a negative or odd value."
+                    )
+                pos = label // 2
+                if pos >= len(cam_keys):
+                    raise RuntimeError(
+                        f"--camera-index {label} maps to position {pos} (0-indexed), but "
+                        f"only {len(cam_keys)} camera(s) were detected."
+                    )
+                key = cam_keys[pos]
+                selected[key] = cameras[key]
+            cameras = selected
+
         NUM_CAMERAS = len(cameras)
         FRAME_SHAPE = (H, W, 3)
         mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
@@ -779,15 +740,15 @@ def main(args):
         results_queues = create_pipeline_shared_ressources()
 
         camera_processes = [
-            Camera(list(cameras.keys())[i], 
-                camera_buffers[i], 
-                camera_timestamps[i], 
-                camera_locks[i], 
-                frame_counters[i], 
-                camera_barrier, 
-                stop_event, 
-                FRAME_SHAPE, 
-                settings.fs, 
+            Camera(list(cameras.keys())[i],
+                camera_buffers[i],
+                camera_timestamps[i],
+                camera_locks[i],
+                frame_counters[i],
+                camera_barrier,
+                stop_event,
+                FRAME_SHAPE,
+                settings.fs,
                 settings.fourcc,)
             for i in range(NUM_CAMERAS)
         ]
@@ -807,6 +768,7 @@ def main(args):
             world_T1_cam=world_T1_cam,
             frame_shape=FRAME_SHAPE,
             num_cameras=NUM_CAMERAS,
+            show_nlf=args.show_nlf,
         )
 
         viewer = ViewerProcess(
@@ -814,6 +776,7 @@ def main(args):
             results_queues=results_queues,
             stop_event=stop_event,
             num_cameras=NUM_CAMERAS,
+            backend=args.visualizer,
         )
 
         processes = camera_processes + [pipeline, viewer]
@@ -832,19 +795,25 @@ def main(args):
 
     else: # offline mode
 
-        server = viser.ViserServer()
-        LOGGER.info(f"[INFO] Viser visualizer available here: http://{server.get_host()}:{server.get_port()}")
+        if args.visualizer == "meshcat":
+            import meshcat
+            server = meshcat.Visualizer()
+            LOGGER.info(f"[INFO] Meshcat visualizer available here: {server.url()}")
+            marker_path = "markers"
+        else:
+            server = viser.ViserServer()
+            LOGGER.info(f"[INFO] Viser visualizer available here: http://{server.get_host()}:{server.get_port()}")
 
-        # Ground grid, matching the floor grid MeshcatVisualizer/pinocchio
-        # shows by default.
-        server.scene.add_grid(
-            "/grid",
-            width=10.0,
-            height=10.0,
-            position=(0.0, 0.0, 0.0),
-        )
+            # Ground grid, matching the floor grid MeshcatVisualizer/pinocchio
+            # shows by default.
+            server.scene.add_grid(
+                "/grid",
+                width=10.0,
+                height=10.0,
+                position=(0.0, 0.0, 0.0),
+            )
 
-        marker_path = "/markers"
+            marker_path = "/markers"
 
         if args.videos and len(args.videos) > 0:
             paths = [Path(v) for v in args.videos]
@@ -852,6 +821,23 @@ def main(args):
             paths = list_videos(Path(args.data_dir))
         if len(paths) == 0:
             raise RuntimeError(f"No videos found in {args.data_dir}")
+
+        if args.camera_index is not None:
+            cam_id_to_path = {}
+            for path in paths:
+                cid = _extract_cam_id(path.stem)
+                if cid is not None:
+                    cam_id_to_path[cid] = path
+
+            selected_paths = []
+            for idx in args.camera_index:
+                if idx not in cam_id_to_path:
+                    raise RuntimeError(
+                        f"--camera-index {idx} not found: detected camera IDs are "
+                        f"{sorted(cam_id_to_path.keys())} (from files {[p.name for p in paths]})"
+                    )
+                selected_paths.append(cam_id_to_path[idx])
+            paths = selected_paths
 
         NUM_CAMERAS = len(paths)
         mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
@@ -885,34 +871,14 @@ def main(args):
 
         stop_event = threading.Event()
 
-        # Core assignment: computed from the CPUs this process is ACTUALLY
-        # allowed to use (respects Docker --cpus / cgroup cpuset limits)
-        allowed_cpus = _get_allowed_cpus()
-
-        if args.no_pin:
-            core_pins = {}
-            LOGGER.info(f"[INFO] Pinning DISABLED (--no-pin). Process allowed CPUs: {allowed_cpus}")
-        else:
-            if args.no_ht:
-                before = allowed_cpus
-                allowed_cpus = _drop_hyperthread_siblings(allowed_cpus)
-                LOGGER.info(f"[INFO] Hyperthreading disabled for this run: "
-                            f"{before} -> {allowed_cpus}")
-
-            core_pins = _compute_core_pins(allowed_cpus)
-            LOGGER.info(f"[INFO] Process allowed CPUs: {allowed_cpus}")
-            LOGGER.info(f"[INFO] Computed core pins: {core_pins}")
-
         (read_times, nlf_times, ik_times, frame_latencies, frame_latency_idx,
          total_first_to_last_s, steady_state_s, warm_steady_state_s,
          tri_filt_times, marker_viz_times, solve_times, display_viz_times,
          ik_class, saved_data) = run_pipelined(
             src, est, server, marker_path, mtxs, dists, projections,
             world_R1_cam, world_T1_cam, settings, total_frames, stop_event,
-            core_pins=core_pins
+            show_nlf=args.show_nlf, visualizer=args.visualizer
         )
-
-        
 
         # Drop ONE-TIME-COST frames (calibration + JIT/first-call spike)
         n_dropped = min(2, len(frame_latencies))
@@ -932,11 +898,9 @@ def main(args):
 
         n_processed = len(frame_latencies)
 
-  # ==============================================================================
+        # ==============================================================================
         # 1. BUILD BENCHMARK STATS DICTIONARY (Calculated Once)
         # ==============================================================================
-        n_processed = len(frame_latencies)
-
         benchmark_stats = {
             "Total Video Frames": str(total_frames),
             "Frames fully processed": str(n_processed),
@@ -960,7 +924,6 @@ def main(args):
         if display_viz_times:
             benchmark_stats["Display viz (viser viz_human.display)"] = f"mean {np.mean(display_viz_times):.1f} ms | median {np.median(display_viz_times):.1f} ms | max {np.max(display_viz_times):.1f} ms"
 
-
         if frame_latencies:
             benchmark_stats["Full Pipeline (per frame, end-to-end)"] = (
                 f"mean {np.mean(frame_latencies):.1f} ms | "
@@ -974,7 +937,6 @@ def main(args):
         if warm_steady_state_s is not None and n_processed > 0:
             benchmark_stats["Steady-state time (init, compilation and first frame excluded)"] = f"{warm_steady_state_s:.2f} s"
             benchmark_stats["Steady-state throughput"] = f"{n_processed / warm_steady_state_s:.2f} FPS"
-
 
         # ==============================================================================
         # 2. CONSOLE PRINTS (Reading Directly from benchmark_stats)
@@ -1013,15 +975,12 @@ def main(args):
             if key in benchmark_stats:
                 print(f"{key}: {benchmark_stats[key]}")
 
-
         # ==============================================================================
         # 3. SAVE CSV WITH HEADER METADATA
         # ==============================================================================
         if getattr(settings, "SAVE_CSV", False):
             save_dir = getattr(settings, "SAVE_DIR", "./output")
             save_joint_angles_csv(saved_data, save_dir, settings, ocp=ik_class, benchmark_stats=benchmark_stats)
-        # if settings.ik_type == 'mhe' and settings.mhe_backend == 'acados' and ik_class is not None:
-        #     ik_class.print_core_performance_breakdown()
 
         src.release()
 
@@ -1031,14 +990,24 @@ if __name__ == "__main__":
     p.add_argument("--online", action="store_true")
     p.add_argument("--data-dir", type=str, default="data", help="Folder containing input videos")
     p.add_argument("--videos", nargs="*", default=None, help="Optional explicit list of input videos")
-    p.add_argument("--no-ht", action="store_true",
-                    help="Treat hyperthread siblings as unavailable for core pinning "
-                         "(container-scoped, no host/root changes -- see "
-                         "_drop_hyperthread_siblings for real host-level SMT-off)")
-    p.add_argument("--no-pin", action="store_true",
-                    help="Disable ALL core pinning -- for baseline comparison "
-                         "profiling (e.g. flamegraph) against the pinned version. "
-                         "Overrides --no-ht (irrelevant when nothing is pinned).")
+
+    p.add_argument("--camera-index", type=int, nargs="*", default=None,
+                   help="Camera selector -- meaning differs by mode. Online: a FIXED "
+                        "positional convention (bus order is arbitrary and uncontrollable), "
+                        "label 0/2/4/6 = 1st/2nd/3rd/4th detected camera regardless of "
+                        "actual device numbering, i.e. position = label // 2. Offline: "
+                        "matches the real 'camera_N' ID burned into video filenames. "
+                        "Defaults to all detected, in order.")
+
+    p.add_argument("--show-nlf", action="store_true",
+                   help="Show a live cv2 window with YOLO boxes + NLF 2D keypoints "
+                        "overlaid per camera, in both online and offline modes.")
+
+    p.add_argument("--visualizer", type=str, choices=["viser", "meshcat"], default="viser",
+                   help="3D display backend for the human model + marker point cloud, "
+                        "in both online (ViewerProcess) and offline (ik_worker) modes. "
+                        "Defaults to viser.")
+
     args = p.parse_args()
 
     if args.online:

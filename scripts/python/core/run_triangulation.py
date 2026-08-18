@@ -91,7 +91,6 @@ def main(args):
         mtxs, dists, projections, rotations, translations = load_camera_parameters(settings.cam_calib_path, NUM_CAMERAS)
         world_R1_cam, world_T1_cam = load_world_transformation(settings.cam_calib_path)
         camera_buffers, camera_timestamps, camera_locks, frame_counters, camera_barrier, stop_event = create_camera_shared_ressources(NUM_CAMERAS, FRAME_SHAPE)
-
         # Create camera processes
         camera_processes = [
             Camera(list(cameras.keys())[i], 
